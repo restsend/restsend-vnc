@@ -27,7 +27,7 @@ pub fn spawn(
     state: Arc<ScreenState>,
 ) -> io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
-        .name("rvnc-capture".into())
+        .name("restsend-vnc-capture".into())
         .spawn(move || run(display_index, fps, state))
         .map_err(io::Error::other)
 }
@@ -118,7 +118,7 @@ fn capture_session(
     let pump_state = Arc::clone(state);
     let (msg_tx, msg_rx) = std::sync::mpsc::channel::<PumpMsg>();
     let pump = std::thread::Builder::new()
-        .name("rvnc-capture-pump".into())
+        .name("restsend-vnc-capture-pump".into())
         .spawn(move || {
             let mut capturer = match build_capturer(display_index, fps) {
                 Ok(c) => c,

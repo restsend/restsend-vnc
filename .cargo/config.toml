@@ -4,7 +4,13 @@
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
 [target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-gnu]
 rustflags = ["-C", "target-feature=+crt-static"]
 
 # `cargo check --target x86_64-pc-windows-msvc` works without an MSVC

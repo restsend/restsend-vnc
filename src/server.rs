@@ -84,7 +84,7 @@ pub fn serve(
         };
         let password = crate::settings::password();
         std::thread::Builder::new()
-            .name("rvnc-session".into())
+            .name("restsend-vnc-session".into())
             .spawn(move || {
                 if let Err(e) = session::handle_client(stream, peer, state, password, cfg, hub) {
                     tracing::debug!("session setup failed for {peer}: {e}");

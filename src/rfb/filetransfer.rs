@@ -310,7 +310,7 @@ mod tests {
             }
         }
         pub fn make() -> TempDirGuard {
-            let base = std::env::temp_dir().join(format!("rvnc-test-{}", std::process::id()));
+            let base = std::env::temp_dir().join(format!("restsend-vnc-test-{}", std::process::id()));
             let path = base.join(format!(
                 "t-{}",
                 std::time::SystemTime::now()

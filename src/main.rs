@@ -31,14 +31,14 @@ fn main() {
     // Logging: RUST_LOG wins; otherwise info (debug with -v).
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         if cli.verbose {
-            "rvnc=debug".into()
+            "restsend_vnc=debug".into()
         } else {
             "info".into()
         }
     });
     #[cfg(all(target_os = "windows", feature = "gui"))]
     {
-        let path = settings::settings_path().with_file_name("rvnc.log");
+        let path = settings::settings_path().with_file_name("restsend-vnc.log");
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -73,7 +73,7 @@ fn main() {
     #[cfg(target_os = "windows")]
     if !single_instance_ok() {
         fatal_dialog(
-            "rvnc is already running.\n\nOnly one instance is allowed.\n\
+            "restsend-vnc is already running.\n\nOnly one instance is allowed.\n\
              Look for the tray icon, or stop the other rvnc process first.",
         );
         std::process::exit(0);
@@ -107,7 +107,7 @@ fn main() {
     if cfg.debug {
         effective.allow_debug = true;
     }
-    if cfg.name != "rvnc" {
+    if cfg.name != "restsend-vnc" {
         effective.title = cfg.name.clone();
     }
     settings::apply_live(&effective);
@@ -135,7 +135,7 @@ fn main() {
     #[cfg(target_os = "windows")]
     if !cfg.test_pattern && !is_elevated() {
         tracing::warn!(
-            "rvnc is not running as administrator: Task Manager, UAC prompts and \
+            "restsend-vnc is not running as administrator: Task Manager, UAC prompts and \
              other elevated windows cannot receive mouse/keyboard input (UIPI). \
              Restart from an elevated terminal to control them."
         );
@@ -150,7 +150,7 @@ fn main() {
     state.set_debug(cfg.debug);
     spawn_sys_sampler(Arc::clone(&state));
     // Encoder reads this when it creates its per-session zlib stream.
-    std::env::set_var("RVNC_ZRLE_LEVEL", cfg.zrle_level.to_string());
+    std::env::set_var("RESTSEND_VNC_ZRLE_LEVEL", cfg.zrle_level.to_string());
     let kind = if cfg.test_pattern {
         screen::ScreenKind::Dummy
     } else {
@@ -290,7 +290,7 @@ fn is_elevated() -> bool {
 /// Samples process CPU/RSS once per second for the debug overlay.
 fn spawn_sys_sampler(state: Arc<framebuffer::ScreenState>) {
     std::thread::Builder::new()
-        .name("rvnc-sys-sampler".into())
+        .name("restsend-vnc-sys-sampler".into())
         .spawn(move || {
             let mut sys = sysinfo::System::new();
             let pid = sysinfo::get_current_pid().ok();
@@ -312,7 +312,7 @@ fn spawn_sys_sampler(state: Arc<framebuffer::ScreenState>) {
 fn single_instance_ok() -> bool {
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
-    let name: Vec<u16> = "Global\\rvnc_single_instance\0".encode_utf16().collect();
+    let name: Vec<u16> = "Global\\restsend_vnc_single_instance\0".encode_utf16().collect();
     match unsafe { CreateMutexW(None, true, windows::core::PCWSTR(name.as_ptr())) } {
         Ok(_) => unsafe { GetLastError() != ERROR_ALREADY_EXISTS },
         Err(_) => true,
@@ -354,7 +354,7 @@ fn fatal_dialog(msg: &str) {
             windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
                 None,
                 windows::core::PCWSTR(text.as_ptr()),
-                windows::core::w!("rvnc"),
+                windows::core::w!("restsend-vnc"),
                 windows::Win32::UI::WindowsAndMessaging::MB_OK
                     | windows::Win32::UI::WindowsAndMessaging::MB_ICONWARNING,
             );

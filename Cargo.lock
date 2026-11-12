@@ -1462,6 +1462,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "restsend-vnc"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "arboard",
+ "chrono",
+ "cipher",
+ "clap",
+ "des",
+ "flate2",
+ "getrandom 0.3.4",
+ "hex",
+ "md-5",
+ "num-bigint",
+ "rpassword",
+ "scap",
+ "sha1",
+ "socket2",
+ "sysinfo 0.32.1",
+ "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
+ "windows 0.62.2",
+ "windows-capture",
+]
+
+[[package]]
 name = "rpassword"
 version = "7.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1506,33 +1533,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "rvnc"
-version = "0.1.0"
-dependencies = [
- "aes",
- "arboard",
- "chrono",
- "cipher",
- "clap",
- "des",
- "flate2",
- "getrandom 0.3.4",
- "hex",
- "md-5",
- "num-bigint",
- "rpassword",
- "scap",
- "sha1",
- "socket2",
- "sysinfo 0.32.1",
- "thiserror 2.0.21",
- "tracing",
- "tracing-subscriber",
- "windows 0.62.2",
- "windows-capture",
-]
 
 [[package]]
 name = "scap"
@@ -2107,8 +2107,6 @@ dependencies = [
 [[package]]
 name = "windows-capture"
 version = "1.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6001b777f61cafce437201de46a019ed7f4afed3b669f02e5ce4e0759164cb3e"
 dependencies = [
  "clap",
  "ctrlc",

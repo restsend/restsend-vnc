@@ -18,7 +18,7 @@ const FALLBACK_H: u32 = 720;
 
 pub fn spawn(state: Arc<ScreenState>) -> JoinHandle<()> {
     std::thread::Builder::new()
-        .name("rvnc-lock-watch".into())
+        .name("restsend-vnc-lock-watch".into())
         .spawn(move || run(state))
         .expect("spawn lock watchdog")
 }

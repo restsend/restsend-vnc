@@ -76,7 +76,7 @@ pub fn handle_client(
     // links where the default (64K) throttles the window.
     let sock = socket2::SockRef::from(&stream);
     let _ = sock.set_send_buffer_size(1 << 20);
-    let trace_path = std::env::var("RVNC_TRACE_INBOUND").ok();
+    let trace_path = std::env::var("RESTSEND_VNC_TRACE_INBOUND").ok();
 
     // --- handshake (needs both directions) ---
     let mut reader_stream = stream.try_clone()?;
@@ -149,13 +149,13 @@ pub fn handle_client(
     // Apple 3.889 clients set the high bit in ClientInit and expect the
     // extended ARD ServerInit ("RFBServerInfo2"): a u32 extra length, then
     // 22 bytes of server information followed by the machine name.
-    let extended = std::env::var_os("RVNC_APPLE_EXTINIT").is_some()
+    let extended = std::env::var_os("RESTSEND_VNC_APPLE_EXTINIT").is_some()
         && (hs.minor == 889 || hs.client_init & 0x80 != 0);
     if extended {
         let extralen = 22 + cfg.name.len();
         init.extend_from_slice(&(extralen as u32).to_be_bytes());
         init.extend_from_slice(&[0u8, 0u8]); // u16 reserved
-        let flags: u32 = std::env::var("RVNC_APPLE_FLAGS")
+        let flags: u32 = std::env::var("RESTSEND_VNC_APPLE_FLAGS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
@@ -165,7 +165,7 @@ pub fn handle_client(
         // Capability bitmask. Byte 2 bit 5 (command 18) advertises stream
         // encryption; clearing it keeps frames plaintext while the clipboard
         // bits (commands 25/35, byte 3 bit 6 / byte 4 bit 4) stay set.
-        let no_enc = std::env::var_os("RVNC_APPLE_NO_ENC").is_some();
+        let no_enc = std::env::var_os("RESTSEND_VNC_APPLE_NO_ENC").is_some();
         let mut caps = [
             0xbf, 0xf6, 0xe7, 0xe3, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00,
@@ -192,7 +192,7 @@ pub fn handle_client(
     // subsequent server->client message with AES-128-CBC.
     let mut pending_setup: Option<Vec<u8>> = None;
     let mut pending_cipher: Option<crate::rfb::apple_auth::AppleStreamCipher> = None;
-    let apple_no_enc = std::env::var_os("RVNC_APPLE_NO_ENC").is_some();
+    let apple_no_enc = std::env::var_os("RESTSEND_VNC_APPLE_NO_ENC").is_some();
     if extended && !apple_no_enc {
         if let Some(dh) = hs.apple_key {
             let mut key = [0u8; 16];
@@ -202,11 +202,11 @@ pub fn handle_client(
             pending_setup = Some(crate::rfb::apple_auth::encryption_setup_message(
                 &dh, &key, &iv,
             ));
-            let seq0: u32 = std::env::var("RVNC_APPLE_SEQ0")
+            let seq0: u32 = std::env::var("RESTSEND_VNC_APPLE_SEQ0")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            let reset = std::env::var_os("RVNC_APPLE_CBC_RESET").is_some();
+            let reset = std::env::var_os("RESTSEND_VNC_APPLE_CBC_RESET").is_some();
             pending_cipher = Some(
                 crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, seq0)
                     .with_iv_reset(reset),
@@ -218,7 +218,7 @@ pub fn handle_client(
     let (tx, rx) = std::sync::mpsc::sync_channel::<OutMsg>(256);
     let queue_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let writer_thread = std::thread::Builder::new()
-        .name("rvnc-session-writer".into())
+        .name("restsend-vnc-session-writer".into())
         .spawn({
             let depth = Arc::clone(&queue_depth);
             move || writer_loop(writer_stream, rx, depth)
@@ -262,7 +262,7 @@ pub fn handle_client(
         fbur_seen: 0,
     };
     std::thread::Builder::new()
-        .name("rvnc-session-pusher".into())
+        .name("restsend-vnc-session-pusher".into())
         .spawn(move || updater.run())
         .expect("spawn session pusher");
 
@@ -275,7 +275,7 @@ pub fn handle_client(
         let (clip_tx, clip_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
         let fwd = tx.clone();
         std::thread::Builder::new()
-            .name("rvnc-clip-fwd".into())
+            .name("restsend-vnc-clip-fwd".into())
             .spawn(move || {
                 while let Ok(v) = clip_rx.recv() {
                     if fwd.send(OutMsg::Data(v)).is_err() {
@@ -303,7 +303,7 @@ pub fn handle_client(
         reader_stream: session_reader_stream,
         apple_key: hs.apple_key,
         apple_seq: Arc::new(std::sync::atomic::AtomicU32::new(
-            std::env::var("RVNC_APPLE_SEQ")
+            std::env::var("RESTSEND_VNC_APPLE_SEQ")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
@@ -331,10 +331,10 @@ pub fn handle_client(
     // shared-clipboard menu items become usable. AppleVNCServer emits it as a
     // plaintext control message (message type 20, cmd 2) while the session is
     // still unencrypted; we do the same shortly after startup.
-    if session.apple_key.is_some() && std::env::var_os("RVNC_APPLE_NO_INFO").is_none() {
+    if session.apple_key.is_some() && std::env::var_os("RESTSEND_VNC_APPLE_NO_INFO").is_none() {
         let tx = session.tx.clone();
         std::thread::Builder::new()
-            .name("rvnc-apple-info".into())
+            .name("restsend-vnc-apple-info".into())
             .spawn(move || {
                 std::thread::sleep(Duration::from_secs(1));
                 let payload = crate::rfb::apple_auth::auto_pasteboard_info(2);
@@ -464,9 +464,9 @@ fn send_interaction_caps(stream: &mut TcpStream, ft_enabled: bool) -> std::io::R
 }
 
 /// Debug aid: force a specific encoding regardless of the client's list.
-/// `RVNC_FORCE_ENCODING=raw|hextile|zrle`.
+/// `RESTSEND_VNC_FORCE_ENCODING=raw|hextile|zrle`.
 fn encoding_override() -> Option<Encoding> {
-    match std::env::var("RVNC_FORCE_ENCODING").ok()?.as_str() {
+    match std::env::var("RESTSEND_VNC_FORCE_ENCODING").ok()?.as_str() {
         "raw" => Some(Encoding::Raw),
         "hextile" => Some(Encoding::Hextile),
         "zrle" => Some(Encoding::Zrle),
@@ -475,7 +475,7 @@ fn encoding_override() -> Option<Encoding> {
 }
 
 /// Reader wrapper that dumps every client->server byte to a file
-/// (`RVNC_TRACE_INBOUND=<path>`) for protocol analysis.
+/// (`RESTSEND_VNC_TRACE_INBOUND=<path>`) for protocol analysis.
 struct TeeReader<'a, R> {
     inner: R,
     out: &'a mut std::fs::File,
@@ -602,7 +602,7 @@ impl Updater {
                     snap.dims()
                 };
                 let t0 = Instant::now();
-                if std::env::var_os("RVNC_NO_FRAMES").is_some() {
+                if std::env::var_os("RESTSEND_VNC_NO_FRAMES").is_some() {
                     // Experiment: keep the session alive without frames.
                     first = false;
                     std::thread::sleep(Duration::from_millis(200));

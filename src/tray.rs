@@ -55,7 +55,7 @@ pub fn spawn() {
         let _ = InitCommonControlsEx(&icc);
     }
     std::thread::Builder::new()
-        .name("rvnc-tray".into())
+        .name("restsend-vnc-tray".into())
         .spawn(|| unsafe { run() })
         .ok();
 }
@@ -66,7 +66,7 @@ fn wide(s: &str) -> Vec<u16> {
 
 unsafe fn run() {
     let hinst = GetModuleHandleW(None).unwrap();
-    let class = w!("rvnc_tray_wnd");
+    let class = w!("restsend_vnc_tray_wnd");
     let wc = WNDCLASSW {
         lpfnWndProc: Some(tray_proc),
         hInstance: hinst.into(),
@@ -77,7 +77,7 @@ unsafe fn run() {
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class,
-        w!("rvnc"),
+        w!("restsend-vnc"),
         WINDOW_STYLE(0),
         0,
         0,
@@ -104,9 +104,12 @@ unsafe fn run() {
         .unwrap_or_default(),
         ..Default::default()
     };
-    let tip = wide("rvnc - VNC server");
-    let n = tip.len().min(nid.szTip.len());
-    nid.szTip[..n].copy_from_slice(&tip[..n]);
+    let tip = wide("restsend-vnc - VNC server");
+    let n = tip.len().min(128); // szTip is [u16; 128]; NOTIFYICONDATAW is packed
+    unsafe {
+        let dst = std::ptr::addr_of_mut!(nid.szTip) as *mut u16;
+        std::ptr::copy_nonoverlapping(tip.as_ptr(), dst, n);
+    }
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
 
     let mut msg = MSG::default();
@@ -136,7 +139,7 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     PCWSTR(url.as_ptr()),
                 );
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, w!("About rvnc"));
+                let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, w!("About restsend-vnc"));
                 let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
@@ -174,7 +177,7 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 }
                 ID_ABOUT => {
                     let body = format!(
-                        "rvnc {}\nbuild {}\n\nRFB 3.8 / Apple 3.889 VNC server\n{}",
+                        "restsend-vnc {}\nbuild {}\n\nRFB 3.8 / Apple 3.889 VNC server\n{}",
                         env!("CARGO_PKG_VERSION"),
                         env!("BUILD_TIME"),
                         crate::settings::url()
@@ -183,7 +186,7 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     MessageBoxW(
                         Some(hwnd),
                         PCWSTR(text.as_ptr()),
-                        w!("About rvnc"),
+                        w!("About restsend-vnc"),
                         MB_OK | MB_ICONINFORMATION,
                     );
                 }
@@ -236,7 +239,7 @@ unsafe fn ctrl(
 
 unsafe fn open_settings() {
     let hinst = GetModuleHandleW(None).unwrap();
-    let class = w!("rvnc_settings_wnd");
+    let class = w!("restsend_vnc_settings_wnd");
     let wc = WNDCLASSW {
         lpfnWndProc: Some(settings_proc),
         hInstance: hinst.into(),
@@ -250,7 +253,7 @@ unsafe fn open_settings() {
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class,
-        w!("rvnc settings"),
+        w!("restsend-vnc settings"),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
@@ -483,7 +486,7 @@ unsafe extern "system" fn settings_proc(
                     },
                     title: {
                         let t = read_text(hwnd, C_TITLE);
-                        if t.trim().is_empty() { "rvnc".to_string() } else { t }
+                        if t.trim().is_empty() { "restsend-vnc".to_string() } else { t }
                     },
                     // Site URL is not edited here; keep the configured/default one.
                     url: crate::settings::url(),

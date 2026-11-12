@@ -30,7 +30,7 @@ impl Default for Settings {
             allow_debug: true,
             url: DEFAULT_URL.to_string(),
             password: None,
-            title: "rvnc".to_string(),
+            title: "restsend-vnc".to_string(),
         }
     }
 }
@@ -52,15 +52,15 @@ static TITLE: OnceLock<Mutex<String>> = OnceLock::new();
 
 pub fn title() -> String {
     TITLE
-        .get_or_init(|| Mutex::new("rvnc".to_string()))
+        .get_or_init(|| Mutex::new("restsend-vnc".to_string()))
         .lock()
         .unwrap()
         .clone()
 }
 
 pub fn set_title(t: &str) {
-    *TITLE.get_or_init(|| Mutex::new("rvnc".to_string())).lock().unwrap() =
-        if t.trim().is_empty() { "rvnc".to_string() } else { t.to_string() };
+    *TITLE.get_or_init(|| Mutex::new("restsend-vnc".to_string())).lock().unwrap() =
+        if t.trim().is_empty() { "restsend-vnc".to_string() } else { t.to_string() };
 }
 
 fn password_cell() -> &'static Mutex<Option<String>> {
@@ -90,11 +90,11 @@ pub fn set_url(u: &str) {
 
 pub fn settings_path() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
-        PathBuf::from(appdata).join("rvnc").join("settings.ini")
+        PathBuf::from(appdata).join("restsend-vnc").join("settings.ini")
     } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".config").join("rvnc").join("settings.ini")
+        PathBuf::from(home).join(".config").join("restsend-vnc").join("settings.ini")
     } else {
-        PathBuf::from("rvnc-settings.ini")
+        PathBuf::from("restsend-vnc-settings.ini")
     }
 }
 

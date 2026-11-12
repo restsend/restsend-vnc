@@ -98,7 +98,7 @@ impl ClipboardHub {
         }
         let hub = Arc::clone(self);
         std::thread::Builder::new()
-            .name("rvnc-clipboard".into())
+            .name("restsend-vnc-clipboard".into())
             .spawn(move || watcher(hub))
             .expect("spawn clipboard watcher");
     }

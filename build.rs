@@ -38,23 +38,51 @@ fn local_string() -> Option<String> {
 }
 
 fn main() {
-    // Windows icon resource (tray + exe icon). Uses mingw's windres.
+    // Windows icon + manifest resource.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=assets/rvnc.rc");
         println!("cargo:rerun-if-changed=assets/rvnc.ico");
+        println!("cargo:rerun-if-changed=assets/rvnc.manifest");
         let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-        let obj = out.join("rvnc_icon.o");
-        let status = std::process::Command::new("x86_64-w64-mingw32-windres")
-            .arg("-i")
-            .arg("assets/rvnc.rc")
-            .arg("-o")
-            .arg(&obj)
-            .status();
-        match status {
-            Ok(st) if st.success() => {
-                println!("cargo:rustc-link-arg-bins={}", obj.display());
+        let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+
+        if env == "msvc" {
+            // Windows SDK resource compiler; link.exe accepts the .res file.
+            // Not always on PATH: if it is missing we still build, just with
+            // the default exe icon.
+            let res = out.join("restsend_vnc_icon.res");
+            let st = std::process::Command::new("rc.exe")
+                .arg("/nologo")
+                .arg("/fo")
+                .arg(&res)
+                .arg("assets/rvnc.rc")
+                .status();
+            match st {
+                Ok(s) if s.success() => {
+                    println!("cargo:rustc-link-arg-bins={}", res.display());
+                }
+                _ => println!("cargo:warning=rc.exe unavailable/failed; default icon used"),
             }
-            _ => println!("cargo:warning=windres failed; using the default exe icon"),
+        } else {
+            let windres = if arch == "x86" {
+                "i686-w64-mingw32-windres"
+            } else {
+                "x86_64-w64-mingw32-windres"
+            };
+            let obj = out.join("restsend_vnc_icon.o");
+            let st = std::process::Command::new(windres)
+                .arg("-i")
+                .arg("assets/rvnc.rc")
+                .arg("-o")
+                .arg(&obj)
+                .status();
+            match st {
+                Ok(s) if s.success() => {
+                    println!("cargo:rustc-link-arg-bins={}", obj.display());
+                }
+                _ => println!("cargo:warning=windres unavailable/failed; default icon used"),
+            }
         }
     }
 

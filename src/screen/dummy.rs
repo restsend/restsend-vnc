@@ -12,7 +12,7 @@ const HEIGHT: u32 = 720;
 
 pub fn spawn(fps: u32, state: Arc<ScreenState>) -> JoinHandle<()> {
     std::thread::Builder::new()
-        .name("rvnc-dummy-capture".into())
+        .name("restsend-vnc-dummy-capture".into())
         .spawn(move || run(fps, state))
         .expect("spawn dummy capture thread")
 }

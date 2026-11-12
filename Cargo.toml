@@ -1,9 +1,10 @@
 [package]
-name = "rvnc"
+name = "restsend-vnc"
 version = "0.1.0"
 edition = "2021"
 description = "A headless, cross-platform (macOS/Windows) VNC server CLI"
 license = "MIT"
+repository = "https://github.com/restsend/restsend-vnc"
 
 [features]
 default = ["gui"]
@@ -52,3 +53,8 @@ windows = { version = "0.62", features = [
 [profile.release]
 lto = "thin"
 strip = true
+
+# windows-capture 1.4.2 uses isize bit ops that do not compile for i686;
+# vendored with a two-line 32-bit fix so win32 builds work too.
+[patch.crates-io]
+windows-capture = { path = "vendor/windows-capture" }

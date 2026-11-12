@@ -10,7 +10,7 @@ pub fn enable() {
     };
 
     let _ = std::thread::Builder::new()
-        .name("rvnc-keep-awake".into())
+        .name("restsend-vnc-keep-awake".into())
         .spawn(|| {
             // The execution state applies to this thread; it must stay alive.
             unsafe {

@@ -62,8 +62,8 @@ pub fn encode_rect(
         Encoding::Zrle => {
             let z = z.get_or_insert_with(|| {
                 // Real-time trade-off: level 6 compresses best but costs CPU.
-                // RVNC_ZRLE_LEVEL lets slow links/CPU pick 1..9.
-                let level = std::env::var("RVNC_ZRLE_LEVEL")
+                // RESTSEND_VNC_ZRLE_LEVEL lets slow links/CPU pick 1..9.
+                let level = std::env::var("RESTSEND_VNC_ZRLE_LEVEL")
                     .ok()
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(6)

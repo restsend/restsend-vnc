@@ -10,10 +10,10 @@ use crate::rfb::filetransfer::ShareRoot;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "rvnc",
+    name = "restsend-vnc",
     version = concat!(env!("CARGO_PKG_VERSION"), " (build ", env!("BUILD_TIME"), ")"),
     about = "A headless VNC server CLI for Windows",
-    after_help = "Examples:\n  rvnc --password secret\n  rvnc --host 0.0.0.0 --port 5900 --password s3cret --share-dir C:\\Public --keep-awake\n  rvnc --test-pattern --port 5901 --no-auth\n\nConnect with any VNC viewer (TightVNC, UltraVNC, TigerVNC, RealVNC...)."
+    after_help = "Examples:\n  restsend-vnc --password secret\n  restsend-vnc --host 0.0.0.0 --port 5900 --password s3cret --share-dir C:\\Public --keep-awake\n  restsend-vnc --test-pattern --port 5901 --no-auth\n\nConnect with any VNC viewer (TightVNC, UltraVNC, TigerVNC, RealVNC...)."
 )]
 pub struct Cli {
     /// Listen address (default 0.0.0.0 = all interfaces; use 127.0.0.1 to
@@ -26,7 +26,7 @@ pub struct Cli {
     pub port: u16,
 
     /// VNC authentication password (protocol uses the first 8 bytes).
-    /// Falls back to the RVNC_PASSWORD environment variable, then to an
+    /// Falls back to the RESTSEND_VNC_PASSWORD environment variable, then to an
     /// interactive prompt.
     #[arg(long)]
     pub password: Option<String>,
@@ -67,7 +67,7 @@ pub struct Cli {
     pub color_level: u8,
 
     /// Session name shown by viewers
-    #[arg(long, default_value = "rvnc")]
+    #[arg(long, default_value = "restsend-vnc")]
     pub name: String,
 
     /// Serve a synthetic animated test pattern instead of the real screen
@@ -131,10 +131,10 @@ impl Config {
             Some(p)
         } else if cli.no_auth {
             None
-        } else if let Ok(p) = std::env::var("RVNC_PASSWORD") {
+        } else if let Ok(p) = std::env::var("RESTSEND_VNC_PASSWORD") {
             if p.is_empty() {
                 return Err(
-                    "RVNC_PASSWORD is empty; set a real password or use --no-auth".into(),
+                    "RESTSEND_VNC_PASSWORD is empty; set a real password or use --no-auth".into(),
                 );
             }
             if p.len() > 8 {
@@ -151,12 +151,12 @@ impl Config {
             // than exiting silently (the tray/log will warn).
             tracing::warn!(
                 "no password configured; GUI build runs WITHOUT authentication \
-                 (set RVNC_PASSWORD or pass --password)"
+                 (set RESTSEND_VNC_PASSWORD or pass --password)"
             );
             None
         } else {
             return Err(
-                "no password configured: pass --password, set RVNC_PASSWORD, or pass --no-auth"
+                "no password configured: pass --password, set RESTSEND_VNC_PASSWORD, or pass --no-auth"
                     .into(),
             );
         };

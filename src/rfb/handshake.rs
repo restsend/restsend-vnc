@@ -196,7 +196,7 @@ pub fn perform(
 ) -> HsResult<HandshakeResult> {
     // Experiment: announce 3.3 / 3.8 to see if Screen Sharing.app accepts a
     // standard RFB session (which would give us the standard clipboard).
-    let version: &[u8; 12] = match std::env::var("RVNC_RFB_VER").as_deref() {
+    let version: &[u8; 12] = match std::env::var("RESTSEND_VNC_RFB_VER").as_deref() {
         Ok("33") => b"RFB 003.003\n",
         Ok("37") => b"RFB 003.007\n",
         Ok("38") => b"RFB 003.008\n",
@@ -229,7 +229,7 @@ pub fn perform(
     if apple_client {
         // No password: try the standard no-auth type first (no login prompt).
         // With a password, Apple DH is required (the client aborts type 2).
-        if password.is_none() && std::env::var_os("RVNC_APPLE_NONE").is_some() {
+        if password.is_none() && std::env::var_os("RESTSEND_VNC_APPLE_NONE").is_some() {
             offered.push(SEC_NONE);
         } else {
             offered.push(SEC_APPLE_DH);
