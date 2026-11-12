@@ -101,7 +101,8 @@ pub struct ScreenState {
     last_publish_ms: AtomicU64,
     /// Maximum publish rate (frames per second).
     pub max_fps: u32,
-    /// Colour level (8/16/24) applied to every published frame.
+    /// Startup colour level (live value comes from `settings::COLOR_LEVEL`).
+    #[allow(dead_code)]
     color_level: u8,
     /// Downscale factor applied before publishing (1.0 = native).
     scale: f32,
@@ -133,22 +134,15 @@ fn fmt_hms(secs: u64) -> String {
 
 /// Masks colour channels to the requested depth. BGRA byte order.
 fn quantize(frame: &mut Frame, level: u8) {
-    match level {
-        8 => {
-            for px in frame.bgra.chunks_exact_mut(4) {
-                px[0] &= 0xC0; // B: 2 bits
-                px[1] &= 0xE0; // G: 3 bits
-                px[2] &= 0xE0; // R: 3 bits
-            }
-        }
-        16 => {
-            for px in frame.bgra.chunks_exact_mut(4) {
-                px[0] &= 0xF8; // B: 5 bits
-                px[1] &= 0xFC; // G: 6 bits
-                px[2] &= 0xF8; // R: 5 bits
-            }
-        }
-        _ => {}
+    // BGRA little-endian: 0xAARRGGBB. One AND per pixel (vectorises well).
+    let mask: u32 = match level {
+        8 => 0xFFE0_E0C0,  // R 3 bits, G 3 bits, B 2 bits
+        16 => 0xFFF8_FCF8, // R 5 bits, G 6 bits, B 5 bits
+        _ => return,
+    };
+    for px in frame.bgra.chunks_exact_mut(4) {
+        let v = u32::from_ne_bytes([px[0], px[1], px[2], px[3]]) & mask;
+        px.copy_from_slice(&v.to_ne_bytes());
     }
 }
 
@@ -246,7 +240,10 @@ impl ScreenState {
         if self.scale < 0.999 {
             frame = frame.resized(self.scale);
         }
-        quantize(&mut frame, self.color_level);
+        // Colour level is read live from settings so changes in the tray take
+        // effect immediately (and survive reconnects).
+        let level = crate::settings::COLOR_LEVEL.load(Ordering::Relaxed);
+        quantize(&mut frame, level);
         if self.debug.load(Ordering::Relaxed) {
             let st = self.stats.lock().unwrap().clone();
             let peer = self.peer.lock().unwrap().clone();

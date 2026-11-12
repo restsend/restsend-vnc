@@ -323,7 +323,9 @@ unsafe fn open_settings() {
         C_COLOR,
         hi,
     );
-    for t in ["24 (full)", "16 (5-6-5)", "8 (3-3-2)"].iter() {
+    for t in ["High quality (24-bit)", "Balanced (16-bit)", "Fastest (8-bit)"]
+        .iter()
+    {
         let wv = wide(t);
         SendMessageW(
             combo,
