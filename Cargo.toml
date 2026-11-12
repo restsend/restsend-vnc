@@ -1,6 +1,6 @@
 [package]
 name = "restsend-vnc"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "A headless, cross-platform (macOS/Windows) VNC server CLI"
 license = "MIT"
@@ -37,10 +37,7 @@ polling = "3"
 rayon = "1.10"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-scap = "0.0.8"
-# scap 0.0.8's Windows engine only compiles against windows-capture 1.4.x;
-# pin it explicitly so a transitive bump can't break the build.
-windows-capture = "=1.4.2"
+windows-capture = "2.0.1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -64,8 +61,3 @@ windows = { version = "0.62", features = [
 lto = "fat"
 codegen-units = 1
 strip = true
-
-# windows-capture 1.4.2 uses isize bit ops that do not compile for i686;
-# vendored with a two-line 32-bit fix so win32 builds work too.
-[patch.crates-io]
-windows-capture = { path = "vendor/windows-capture" }

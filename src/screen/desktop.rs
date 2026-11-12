@@ -1,22 +1,35 @@
-//! Real-desktop capture via the `scap` crate (Windows.Graphics.Capture on
-//! Windows). Recreates the capturer automatically when the display
-//! resolution changes, and self-heals when no frames are produced at all
-//! (e.g. rvnc running in a service/SSH session without an interactive
-//! desktop).
+//! Real-desktop capture via `windows-capture` (Windows.Graphics.Capture).
+//!
+//! This replaces the `scap` wrapper with a small direct adapter: monitor
+//! selection, a capture handler that publishes BGRA frames into
+//! [`ScreenState`], and a supervisor that restarts the capture thread when it
+//! dies and gives up when no frame ever arrives (for example when rvnc runs in
+//! a service/SSH session without an interactive desktop).
+//!
+//! The pointer is handled separately (cursor pseudo-encoding or a
+//! server-composited overlay), so cursor capture is disabled when the OS
+//! supports that setting. The capture border is disabled on Windows 11; on
+//! older builds the OS-mandated border is left alone instead of failing.
 
 use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use scap::capturer::{Capturer, Options, Resolution};
-use scap::frame::{Frame as ScapFrame, FrameType};
-use scap::{get_all_targets, Target};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
+use windows_capture::frame::Frame as CaptureFrame;
+use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
+use windows_capture::monitor::Monitor;
+use windows_capture::settings::{
+    ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
+    MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+};
 
 use crate::framebuffer::{Frame, ScreenState};
 
-/// Give a fresh capturer this long to produce its first frame before
-/// declaring the capture session stale and rebuilding.
+/// Give a fresh capture session this long to produce its first frame before
+/// declaring it stale and starting over.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 /// Consecutive stale starts before giving up entirely.
 const MAX_STALE_STARTS: u32 = 5;
@@ -32,67 +45,128 @@ pub fn spawn(
         .map_err(io::Error::other)
 }
 
-fn pick_target(display_index: usize) -> io::Result<Target> {
-    let displays: Vec<Target> = get_all_targets()
-        .into_iter()
-        .filter(|t| matches!(t, Target::Display(_)))
-        .collect();
-    displays.get(display_index).cloned().ok_or_else(|| {
+fn pick_monitor(display_index: usize) -> io::Result<Monitor> {
+    let monitors = Monitor::enumerate()
+        .map_err(|e| io::Error::other(format!("monitor enumeration failed: {e}")))?;
+    monitors.get(display_index).copied().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!(
                 "display index {display_index} not found ({} display(s) available)",
-                displays.len()
+                monitors.len()
             ),
         )
     })
 }
 
-fn build_capturer(display_index: usize, fps: u32, state: &ScreenState) -> io::Result<Capturer> {
-    let target = pick_target(display_index)?;
-    remember_display_rect(&target, state);
-    let options = Options {
-        fps: fps.max(1),
-        // The pointer is handled separately (cursor pseudo-encoding or a
-        // server-composited overlay). Burning it into the frame would make
-        // every mouse move trigger a full 4K capture + diff + encode pass.
-        show_cursor: false,
-        show_highlight: false,
-        output_type: FrameType::BGRAFrame,
-        output_resolution: Resolution::Captured, // native pixels * scale factor
-        target: Some(target),
-        crop_area: None,
-        excluded_targets: None,
-    };
-    let capturer = Capturer::build(options)
-        .map_err(|e| io::Error::other(format!("capturer build failed: {e:?}")))?;
-    Ok(capturer)
-}
-
 /// Records the captured monitor's physical rect so the cursor poller can map
 /// `GetCursorPos` into framebuffer coordinates (including `--scale`).
-fn remember_display_rect(target: &Target, state: &ScreenState) {
-    use windows::Win32::Foundation::RECT;
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
-    if let Target::Display(display) = target {
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            rcMonitor: RECT::default(),
-            rcWork: RECT::default(),
-            dwFlags: 0,
-        };
-        // scap links a different windows-rs version; rebuild the handle in
-        // our own type space (both are raw HMONITOR pointers).
-        let monitor = windows::Win32::Graphics::Gdi::HMONITOR(display.raw_handle.0);
-        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-            let r = info.rcMonitor;
-            state.set_cursor_map(
-                r.left,
-                r.top,
-                (r.right - r.left).max(1) as u32,
-                (r.bottom - r.top).max(1) as u32,
-            );
+fn remember_display_rect(monitor: &Monitor, state: &ScreenState) {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let handle = HMONITOR(monitor.as_raw_hmonitor());
+    if unsafe { GetMonitorInfoW(handle, &mut info) }.as_bool() {
+        let r = info.rcMonitor;
+        state.set_cursor_map(
+            r.left,
+            r.top,
+            (r.right - r.left).max(1) as u32,
+            (r.bottom - r.top).max(1) as u32,
+        );
+    }
+}
+
+/// The capture handler owns a copy of the monitor so it can refresh the cursor
+/// mapping when the desktop geometry changes.
+struct CaptureHandler {
+    state: Arc<ScreenState>,
+    monitor: Monitor,
+    dims: Option<(u32, u32)>,
+}
+
+impl GraphicsCaptureApiHandler for CaptureHandler {
+    type Flags = (Arc<ScreenState>, Monitor);
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
+        let (state, monitor) = ctx.flags;
+        Ok(Self {
+            state,
+            monitor,
+            dims: None,
+        })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut CaptureFrame,
+        _capture_control: InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        if self.state.is_stopped() {
+            return Ok(());
         }
+        let (w, h) = (frame.width(), frame.height());
+        if w == 0 || h == 0 {
+            return Ok(());
+        }
+        let stride = (w as usize).checked_mul(4).ok_or("frame width overflow")?;
+        let size = stride
+            .checked_mul(h as usize)
+            .ok_or("frame size overflow")?;
+
+        let mut buf = frame
+            .buffer()
+            .map_err(|e| format!("cannot map capture frame: {e}"))?;
+        let mut bgra = Vec::with_capacity(size);
+        if buf.has_padding() {
+            let row_pitch = buf.row_pitch() as usize;
+            let raw = buf.as_raw_buffer();
+            if row_pitch < stride {
+                return Err("capture row pitch is smaller than the frame width".into());
+            }
+            for y in 0..h as usize {
+                let start = y
+                    .checked_mul(row_pitch)
+                    .ok_or("capture row offset overflow")?;
+                let end = start + stride;
+                if end > raw.len() {
+                    return Err("capture frame buffer is shorter than expected".into());
+                }
+                bgra.extend_from_slice(&raw[start..end]);
+            }
+        } else {
+            let raw = buf.as_raw_buffer();
+            if raw.len() < size {
+                return Err("capture frame buffer is shorter than expected".into());
+            }
+            bgra.extend_from_slice(&raw[..size]);
+        }
+        if bgra.len() != size {
+            return Err("capture frame size mismatch".into());
+        }
+
+        if self.dims != Some((w, h)) {
+            match self.dims {
+                None => tracing::info!("first frame captured ({}x{})", w, h),
+                Some((old_w, old_h)) => tracing::info!(
+                    "display size changed from {}x{} to {}x{}",
+                    old_w,
+                    old_h,
+                    w,
+                    h
+                ),
+            }
+            self.dims = Some((w, h));
+            remember_display_rect(&self.monitor, &self.state);
+        }
+        self.state.publish_capture(Frame {
+            width: w,
+            height: h,
+            bgra,
+        });
+        Ok(())
     }
 }
 
@@ -105,11 +179,7 @@ fn run(display_index: usize, fps: u32, state: Arc<ScreenState>) {
         let generation_before = state.generation();
         match capture_session(display_index, fps, &state) {
             Ok(()) => return, // stopped
-            Err(CaptureError::ResolutionChange) => {
-                tracing::info!("display size changed, rebuilding capturer");
-                std::thread::sleep(Duration::from_millis(300));
-            }
-            Err(CaptureError::Engine(e)) => {
+            Err(e) => {
                 if state.generation() == generation_before {
                     stale_starts += 1;
                 } else {
@@ -128,171 +198,88 @@ fn run(display_index: usize, fps: u32, state: Arc<ScreenState>) {
     }
 }
 
-enum CaptureError {
-    ResolutionChange,
-    Engine(io::Error),
-}
-
-enum PumpMsg {
-    Started(u32, u32),
-    Exit(io::Result<()>),
-}
-
 fn capture_session(
     display_index: usize,
     fps: u32,
     state: &Arc<ScreenState>,
-) -> Result<(), CaptureError> {
-    // The pump owns the capturer exclusively: `get_next_frame` blocks, the
-    // capturer itself is not `Send` across the boundary, and no one else may
-    // hold a reference to it while it blocks.
-    let pump_state = Arc::clone(state);
-    let (msg_tx, msg_rx) = std::sync::mpsc::channel::<PumpMsg>();
-    let pump = std::thread::Builder::new()
-        .name("restsend-vnc-capture-pump".into())
-        .spawn(move || {
-            let mut capturer = match build_capturer(display_index, fps, &pump_state) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = msg_tx.send(PumpMsg::Exit(Err(e)));
-                    return;
-                }
-            };
-            let [w, h] = capturer.get_output_frame_size();
-            if msg_tx.send(PumpMsg::Started(w, h)).is_err() {
-                return;
-            }
-            capturer.start_capture();
-            let _ = msg_tx.send(PumpMsg::Exit(pump_loop(&mut capturer, &pump_state)));
-        })
-        .map_err(CaptureError::Engine)?;
+) -> Result<(), io::Error> {
+    let monitor = pick_monitor(display_index)?;
+    remember_display_rect(&monitor, state);
+    if let (Ok(w), Ok(h)) = (monitor.width(), monitor.height()) {
+        tracing::info!("capturing display {display_index} ({w}x{h})");
+    }
 
-    // Wait for the engine to come up.
-    let dims = match msg_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(PumpMsg::Started(w, h)) => (w, h),
-        Ok(PumpMsg::Exit(Err(e))) => {
-            let _ = pump.join();
-            return Err(CaptureError::Engine(e));
-        }
-        Ok(PumpMsg::Exit(Ok(()))) => {
-            let _ = pump.join();
-            return Ok(());
-        }
-        Err(_) => {
-            let _ = pump.join();
-            return Err(CaptureError::Engine(io::Error::other(
-                "capture pump thread panicked",
-            )));
-        }
+    // Be conservative on older Windows builds: only request optional WGC
+    // features that this OS advertises. Requesting an unsupported feature
+    // makes windows-capture reject the whole session.
+    let cursor = if GraphicsCaptureApi::is_cursor_settings_supported().unwrap_or(false) {
+        CursorCaptureSettings::WithoutCursor
+    } else {
+        tracing::warn!("this Windows build cannot disable cursor capture");
+        CursorCaptureSettings::Default
     };
-    tracing::info!("capturing display {display_index} ({}x{})", dims.0, dims.1);
+    let border = if GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false) {
+        DrawBorderSettings::WithoutBorder
+    } else {
+        tracing::warn!("this Windows build cannot disable the capture border");
+        DrawBorderSettings::Default
+    };
+    let interval = if GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(false) {
+        MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(
+            1_000_000_000 / u64::from(fps.max(1)),
+        ))
+    } else {
+        MinimumUpdateIntervalSettings::Default
+    };
 
-    // Parent: supervises the pump — detects a dead engine and a capturer that
-    // never produces its first frame (the pump would otherwise block in
-    // `get_next_frame` forever, and viewers would stare at a blank screen).
+    let settings = Settings::new(
+        monitor,
+        cursor,
+        border,
+        SecondaryWindowSettings::Default,
+        interval,
+        DirtyRegionSettings::Default,
+        ColorFormat::Bgra8,
+        (Arc::clone(state), monitor),
+    );
+
+    let control = CaptureHandler::start_free_threaded(settings)
+        .map_err(|e| io::Error::other(format!("capture start failed: {e}")))?;
+
     let started = Instant::now();
     let mut generation_before = state.generation();
     let mut stale_warned = false;
-    let result = loop {
-        if state.is_stopped() {
-            break Ok(());
-        }
-        match msg_rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(PumpMsg::Exit(Ok(()))) => break Ok(()), // pump stopped cleanly
-            Ok(PumpMsg::Exit(Err(e))) if e.kind() == io::ErrorKind::WouldBlock => {
-                break Err(CaptureError::ResolutionChange);
-            }
-            Ok(PumpMsg::Exit(Err(e))) => break Err(CaptureError::Engine(e)),
-            Ok(PumpMsg::Started(..)) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                break Err(CaptureError::Engine(io::Error::other(
-                    "capture pump thread panicked",
-                )));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if state.generation() != generation_before {
-                    // frames are flowing; reset the stale clock
-                    generation_before = state.generation();
-                    continue;
-                }
-                if started.elapsed() > FIRST_FRAME_TIMEOUT && !stale_warned {
-                    stale_warned = true;
-                    tracing::error!(
-                        "no frames {}s after capture start; hints: rvnc must run in an \
-                         interactive desktop session (not a service/SSH session), \
-                         Windows 10 1903+ is required, and the --display index must exist",
-                        FIRST_FRAME_TIMEOUT.as_secs()
-                    );
-                    // Keep waiting a while longer in case frames come late;
-                    // the outer loop counts consecutive stale starts and
-                    // gives up after {MAX_STALE_STARTS}.
-                    if started.elapsed() > FIRST_FRAME_TIMEOUT * 4 {
-                        break Err(CaptureError::Engine(io::Error::other(
-                            "no frames ever captured (stale)",
-                        )));
-                    }
-                }
-            }
-        }
-    };
-
-    let _ = pump.join();
-    result
-}
-
-/// Owns the capturer; publishes frames until stop / engine death / size change.
-fn pump_loop(capturer: &mut Capturer, state: &Arc<ScreenState>) -> io::Result<()> {
-    let mut expected_dims: Option<(u32, u32)> = None;
     loop {
         if state.is_stopped() {
-            capturer.stop_capture();
+            let _ = control.stop();
             return Ok(());
         }
-
-        let frame = capturer.get_next_frame().map_err(io::Error::other)?;
-
-        let ScapFrame::BGRA(bgra) = frame else {
-            continue;
-        };
-        let (w, h) = (bgra.width.max(0) as u32, bgra.height.max(0) as u32);
-        if w == 0 || h == 0 {
-            continue; // Idle frame placeholder from the engine
-        }
-        if Some((w, h)) != expected_dims && expected_dims.is_some() {
-            // Display resolution changed -> let the supervisor rebuild us.
-            tracing::info!(
-                "display resolution changed to {}x{}, rebuilding capturer",
-                w,
-                h
-            );
-            capturer.stop_capture();
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "resolution change",
-            ));
-        }
-        let want = w as usize * h as usize * 4;
-        if bgra.data.len() == want {
-            // Take the capture buffer directly: `Frame::new` would zero a
-            // fresh 4K buffer (33 MB) just before it is overwritten.
-            let out = Frame {
-                width: w,
-                height: h,
-                bgra: bgra.data,
+        if control.is_finished() {
+            return match control.wait() {
+                Ok(()) if state.is_stopped() => Ok(()),
+                Ok(()) => Err(io::Error::other("capture session ended unexpectedly")),
+                Err(e) => Err(io::Error::other(format!("capture session ended: {e}"))),
             };
-            state.publish_capture(out);
-            if expected_dims.is_none() {
-                tracing::info!("first frame captured ({}x{})", w, h);
-            }
-            expected_dims = Some((w, h));
-        } else {
-            tracing::debug!(
-                "skipping malformed frame {}x{} ({} bytes, want {})",
-                w,
-                h,
-                bgra.data.len(),
-                want
-            );
         }
+        if state.generation() != generation_before {
+            // Frames are flowing; reset the stale clock.
+            generation_before = state.generation();
+        } else if started.elapsed() > FIRST_FRAME_TIMEOUT && !stale_warned {
+            stale_warned = true;
+            tracing::error!(
+                "no frames {}s after capture start; hints: rvnc must run in an \
+                 interactive desktop session (not a service/SSH session), \
+                 Windows 10 1903+ is required, and the --display index must exist",
+                FIRST_FRAME_TIMEOUT.as_secs()
+            );
+            // Keep waiting a while longer in case frames come late; the outer
+            // loop counts consecutive stale starts and gives up after
+            // MAX_STALE_STARTS.
+            if started.elapsed() > FIRST_FRAME_TIMEOUT * 4 {
+                let _ = control.stop();
+                return Err(io::Error::other("no frames ever captured (stale)"));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
