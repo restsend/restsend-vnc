@@ -1,0 +1,46 @@
+name: build-windows
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  # Canonical artifact: official MSVC ABI + static CRT (no VC Redistributable needed).
+  build-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build (static CRT via .cargo/config.toml)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Verify imports (system DLLs only)
+        shell: pwsh
+        run: |
+          $imports = dumpbin /dependents target/x86_64-pc-windows-msvc/release/rvnc.exe |
+            Select-String "\.dll"
+          $imports
+          if ("$imports" -match "vcruntime|msvcp|msvcrt") {
+            throw "unexpected CRT dependency"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvnc-windows-x64-msvc
+          path: target/x86_64-pc-windows-msvc/release/rvnc.exe
+
+  # Proof that the binary cross-builds from a non-Windows host (GNU toolchain).
+  build-cross-gnu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - run: cargo build --release --target x86_64-pc-windows-gnu
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rvnc-windows-x64-gnu
+          path: target/x86_64-pc-windows-gnu/release/rvnc.exe

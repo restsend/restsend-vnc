@@ -1,0 +1,54 @@
+[package]
+name = "rvnc"
+version = "0.1.0"
+edition = "2021"
+description = "A headless, cross-platform (macOS/Windows) VNC server CLI"
+license = "MIT"
+
+[features]
+default = ["gui"]
+gui = []
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+des = "0.8"
+cipher = "0.4"
+getrandom = "0.3"
+rpassword = "7"
+thiserror = "2"
+arboard = "3"
+num-bigint = "0.4"
+md-5 = "0.10"
+aes = "0.8"
+sha1 = "0.10"
+hex = "0.4"
+socket2 = "0.5"
+sysinfo = "0.32"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+scap = "0.0.8"
+# scap 0.0.8's Windows engine only compiles against windows-capture 1.4.x;
+# pin it explicitly so a transitive bump can't break the build.
+windows-capture = "=1.4.2"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Controls",
+    "Win32_Security",
+] }
+
+[profile.release]
+lto = "thin"
+strip = true
