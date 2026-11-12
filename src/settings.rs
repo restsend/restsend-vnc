@@ -28,6 +28,8 @@ pub struct Settings {
     pub port: u16,
     pub color_level: u8,
     pub loopback_only: bool,
+    /// Ask the local user to accept every new connection before ServerInit.
+    pub confirm_connections: bool,
     pub keep_awake: bool,
     pub allow_debug: bool,
     pub url: String,
@@ -52,6 +54,7 @@ impl Default for Settings {
             port: 5900,
             color_level: 16,
             loopback_only: false,
+            confirm_connections: false,
             keep_awake: true,
             allow_debug: true,
             url: DEFAULT_URL.to_string(),
@@ -72,6 +75,8 @@ impl Default for Settings {
 pub static PORT: AtomicU16 = AtomicU16::new(5900);
 pub static COLOR_LEVEL: AtomicU8 = AtomicU8::new(16);
 pub static LOOPBACK_ONLY: AtomicBool = AtomicBool::new(false);
+/// Ask the local user to accept each new connection (live, applies at once).
+pub static CONFIRM_CONNECTIONS: AtomicBool = AtomicBool::new(false);
 pub static KEEP_AWAKE: AtomicBool = AtomicBool::new(true);
 pub static ALLOW_DEBUG: AtomicBool = AtomicBool::new(true);
 /// Encryption policy (0 = off, 1 = auto/prefer TLS, 2 = required).
@@ -143,6 +148,11 @@ pub fn share_files() -> bool {
     SHARE_FILES.load(Ordering::Relaxed)
 }
 
+/// True when each new connection must be accepted by the local user.
+pub fn confirm_connections() -> bool {
+    CONFIRM_CONNECTIONS.load(Ordering::Relaxed)
+}
+
 /// Resolves the live share root for new connections. `None` means the
 /// TightVNC file-transfer extension stays disabled.
 pub fn share_root() -> Option<Arc<ShareRoot>> {
@@ -171,8 +181,14 @@ pub fn title() -> String {
 }
 
 pub fn set_title(t: &str) {
-    *TITLE.get_or_init(|| Mutex::new("restsend-vnc".to_string())).lock().unwrap() =
-        if t.trim().is_empty() { "restsend-vnc".to_string() } else { t.to_string() };
+    *TITLE
+        .get_or_init(|| Mutex::new("restsend-vnc".to_string()))
+        .lock()
+        .unwrap() = if t.trim().is_empty() {
+        "restsend-vnc".to_string()
+    } else {
+        t.to_string()
+    };
 }
 
 fn password_cell() -> &'static Mutex<Option<String>> {
@@ -187,6 +203,7 @@ pub fn set_password(p: Option<String>) {
     *password_cell().lock().unwrap() = p;
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn url() -> String {
     URL.get_or_init(|| Mutex::new(DEFAULT_URL.to_string()))
         .lock()
@@ -202,9 +219,14 @@ pub fn set_url(u: &str) {
 
 pub fn settings_path() -> PathBuf {
     if let Ok(appdata) = std::env::var("APPDATA") {
-        PathBuf::from(appdata).join("restsend-vnc").join("settings.ini")
+        PathBuf::from(appdata)
+            .join("restsend-vnc")
+            .join("settings.ini")
     } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".config").join("restsend-vnc").join("settings.ini")
+        PathBuf::from(home)
+            .join(".config")
+            .join("restsend-vnc")
+            .join("settings.ini")
     } else {
         PathBuf::from("restsend-vnc-settings.ini")
     }
@@ -236,6 +258,9 @@ pub fn load() -> Settings {
                 }
             }
             "loopback_only" => s.loopback_only = v == "1" || v.eq_ignore_ascii_case("true"),
+            "confirm_connections" => {
+                s.confirm_connections = v == "1" || v.eq_ignore_ascii_case("true")
+            }
             "keep_awake" => s.keep_awake = v == "1" || v.eq_ignore_ascii_case("true"),
             "allow_debug" => s.allow_debug = v == "1" || v.eq_ignore_ascii_case("true"),
             "title" => s.title = v.to_string(),
@@ -252,15 +277,29 @@ pub fn load() -> Settings {
                     s.tls = mode;
                 }
             }
-            "tls_cert" => s.tls_cert = if v.is_empty() { None } else { Some(v.to_string()) },
-            "tls_key" => s.tls_key = if v.is_empty() { None } else { Some(v.to_string()) },
-            "password" => {
-                s.password = if v.is_empty() { None } else { Some(v.to_string()) };
-            }
-            "url" => {
-                if !v.is_empty() {
-                    s.url = v.to_string();
+            "tls_cert" => {
+                s.tls_cert = if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
                 }
+            }
+            "tls_key" => {
+                s.tls_key = if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                }
+            }
+            "password" => {
+                s.password = if v.is_empty() {
+                    None
+                } else {
+                    Some(v.to_string())
+                };
+            }
+            "url" if !v.is_empty() => {
+                s.url = v.to_string();
             }
             _ => {}
         }
@@ -274,10 +313,11 @@ pub fn save(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nshare_files={}\nshare_dir={}\ntls={}\ntls_cert={}\ntls_key={}\nurl={}\n",
+        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nconfirm_connections={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nshare_files={}\nshare_dir={}\ntls={}\ntls_cert={}\ntls_key={}\nurl={}\n",
         s.port,
         s.color_level,
         s.loopback_only as u8,
+        s.confirm_connections as u8,
         s.keep_awake as u8,
         s.allow_debug as u8,
         s.password.clone().unwrap_or_default(),
@@ -300,6 +340,7 @@ pub fn save(s: &Settings) {
 pub fn apply_live(s: &Settings) {
     COLOR_LEVEL.store(s.color_level, Ordering::Relaxed);
     let old_loop = LOOPBACK_ONLY.swap(s.loopback_only, Ordering::Relaxed);
+    CONFIRM_CONNECTIONS.store(s.confirm_connections, Ordering::Relaxed);
     KEEP_AWAKE.store(s.keep_awake, Ordering::Relaxed);
     ALLOW_DEBUG.store(s.allow_debug, Ordering::Relaxed);
     SHARE_FILES.store(s.share_files, Ordering::Relaxed);
@@ -320,15 +361,18 @@ static LOGON_TASK: AtomicBool = AtomicBool::new(false);
 pub fn set_autostart_task(on: bool) {
     LOGON_TASK.store(on, Ordering::Relaxed);
 }
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn logon_task_flag() -> bool {
     LOGON_TASK.load(Ordering::Relaxed)
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn current() -> Settings {
     Settings {
         port: PORT.load(Ordering::Relaxed),
         color_level: COLOR_LEVEL.load(Ordering::Relaxed),
         loopback_only: LOOPBACK_ONLY.load(Ordering::Relaxed),
+        confirm_connections: confirm_connections(),
         keep_awake: KEEP_AWAKE.load(Ordering::Relaxed),
         allow_debug: ALLOW_DEBUG.load(Ordering::Relaxed),
         url: url(),

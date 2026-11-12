@@ -162,6 +162,7 @@ impl PixelEncoder {
     /// Number of bytes in a ZRLE/TRLE CPIXEL (RFC 6143 §7.7.5): 3 bytes when
     /// true-colour 32bpp with depth <= 24 and the colour bits fit in the
     /// least-significant 3 bytes, otherwise the full pixel size.
+    #[allow(dead_code)]
     pub fn cpixel_bytes(&self) -> usize {
         if self.cpixel3() {
             3
@@ -241,6 +242,27 @@ impl PixelEncoder {
     }
 }
 
+/// SSSE3 fast path: BGRA8 row -> packed 3-byte CPIXEL row (alpha dropped).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn push_cpixel3_row_ssse3(out: &mut Vec<u8>, row_bgra: &[u8], width: usize) {
+    use std::arch::x86_64::*;
+    // Keep bytes 0,1,2 of each 4-byte pixel; discard the fourth.
+    let mask = _mm_setr_epi8(0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1);
+    let mut i = 0usize;
+    while i + 4 <= width {
+        let src = row_bgra.as_ptr().add(i * 4);
+        let v = _mm_loadu_si128(src as *const __m128i);
+        let packed = _mm_shuffle_epi8(v, mask);
+        let mut tmp = [0u8; 16];
+        _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, packed);
+        out.extend_from_slice(&tmp[..12]);
+        i += 4;
+    }
+    for px in row_bgra[i * 4..width * 4].chunks_exact(4) {
+        out.extend_from_slice(&px[..3]);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -292,28 +314,5 @@ mod tests {
         let mut buf = Vec::new();
         fmt.write(&mut buf);
         assert_eq!(PixelFormat::parse(&buf).unwrap(), fmt);
-    }
-}
-
-
-/// SSSE3 fast path: BGRA8 row -> packed 3-byte CPIXEL row (alpha dropped).
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "ssse3")]
-unsafe fn push_cpixel3_row_ssse3(out: &mut Vec<u8>, row_bgra: &[u8], width: usize) {
-    use std::arch::x86_64::*;
-    // Keep bytes 0,1,2 of each 4-byte pixel; discard the fourth.
-    let mask = _mm_setr_epi8(0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1);
-    let mut i = 0usize;
-    while i + 4 <= width {
-        let src = row_bgra.as_ptr().add(i * 4);
-        let v = _mm_loadu_si128(src as *const __m128i);
-        let packed = _mm_shuffle_epi8(v, mask);
-        let mut tmp = [0u8; 16];
-        _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, packed);
-        out.extend_from_slice(&tmp[..12]);
-        i += 4;
-    }
-    for px in row_bgra[i * 4..width * 4].chunks_exact(4) {
-        out.extend_from_slice(&px[..3]);
     }
 }

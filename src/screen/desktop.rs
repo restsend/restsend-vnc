@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use scap::capturer::{Capturer, Options, Resolution};
 use scap::frame::{Frame as ScapFrame, FrameType};
-use scap::{Target, get_all_targets};
+use scap::{get_all_targets, Target};
 
 use crate::framebuffer::{Frame, ScreenState};
 
@@ -48,11 +48,7 @@ fn pick_target(display_index: usize) -> io::Result<Target> {
     })
 }
 
-fn build_capturer(
-    display_index: usize,
-    fps: u32,
-    state: &ScreenState,
-) -> io::Result<Capturer> {
+fn build_capturer(display_index: usize, fps: u32, state: &ScreenState) -> io::Result<Capturer> {
     let target = pick_target(display_index)?;
     remember_display_rect(&target, state);
     let options = Options {
@@ -76,8 +72,8 @@ fn build_capturer(
 /// Records the captured monitor's physical rect so the cursor poller can map
 /// `GetCursorPos` into framebuffer coordinates (including `--scale`).
 fn remember_display_rect(target: &Target, state: &ScreenState) {
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
     use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
     if let Target::Display(display) = target {
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -270,7 +266,10 @@ fn pump_loop(capturer: &mut Capturer, state: &Arc<ScreenState>) -> io::Result<()
                 h
             );
             capturer.stop_capture();
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "resolution change"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "resolution change",
+            ));
         }
         let want = w as usize * h as usize * 4;
         if bgra.data.len() == want {

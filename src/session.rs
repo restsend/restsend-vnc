@@ -27,12 +27,12 @@ use crate::cursor::{
 use crate::diff::{diff_tiles, Rect};
 use crate::encode::{encode_rect, Encoding};
 use crate::framebuffer::{Frame, ScreenState};
-use crate::throttle::{cursor_interval, ByteBudget};
 use crate::input::InputBackend;
 use crate::rfb::filetransfer::{self, ShareRoot, UploadState};
 use crate::rfb::handshake::{self, HandshakeError};
 use crate::rfb::messages::{self, pseudo, rect_header, ClientMessage, UploadPayload};
 use crate::rfb::pixel::{PixelEncoder, PixelFormat};
+use crate::throttle::{cursor_interval, ByteBudget};
 
 /// Hard cap on the wire bytes of one framebuffer update. The time budget
 /// below is the primary limiter; this only prevents pathological messages.
@@ -128,6 +128,15 @@ pub fn handle_client(
         }
     };
     let _ = stream.set_read_timeout(None);
+    let client_info = describe_client(&hs);
+
+    // A local user can require manual approval for every new connection. This
+    // runs after authentication (wrong passwords never prompt) and before
+    // ServerInit, so a rejected client never receives any screen data.
+    if !crate::approval::request(&stream, peer, &client_info) {
+        tracing::info!("{peer}: connection not approved; closing");
+        return Ok(());
+    }
 
     // --- transport: plain socket halves or TLS pump ---
     let crate::transport::Io {
@@ -142,7 +151,6 @@ pub fn handle_client(
     let mut reader = reader;
 
     state.set_peer(peer.to_string());
-    let client_info = describe_client(&hs);
     state.set_client_info(client_info.clone());
     crate::audit::log("connect", &peer, &client_info, None);
     let session_started = Instant::now();
@@ -151,7 +159,11 @@ pub fn handle_client(
         hs.minor,
         hs.security_type,
         hs.auth,
-        if hs.encrypted { "encrypted" } else { "plaintext" },
+        if hs.encrypted {
+            "encrypted"
+        } else {
+            "plaintext"
+        },
         hs.tight
     );
 
@@ -195,11 +207,11 @@ pub fn handle_client(
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         init.extend_from_slice(&flags.to_be_bytes()); // flags (bit0/bit1)
-        // Server info block (AppleVNCServer's gServerInfo: magic + feature
-        // flags; the default table advertises commands 34..39).
-        // Capability bitmask. Byte 2 bit 5 (command 18) advertises stream
-        // encryption; clearing it keeps frames plaintext while the clipboard
-        // bits (commands 25/35, byte 3 bit 6 / byte 4 bit 4) stay set.
+                                                      // Server info block (AppleVNCServer's gServerInfo: magic + feature
+                                                      // flags; the default table advertises commands 34..39).
+                                                      // Capability bitmask. Byte 2 bit 5 (command 18) advertises stream
+                                                      // encryption; clearing it keeps frames plaintext while the clipboard
+                                                      // bits (commands 25/35, byte 3 bit 6 / byte 4 bit 4) stay set.
         let no_enc = std::env::var_os("RESTSEND_VNC_APPLE_NO_ENC").is_some();
         let mut caps = [
             0xbf, 0xf6, 0xe7, 0xe3, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -219,7 +231,10 @@ pub fn handle_client(
 
     // --- Tight interaction caps (advertises file-transfer extensions) ---
     if hs.tight {
-        send_interaction_caps(writer_stream.as_mut(), cfg.share_root.is_some() && !cfg.view_only)?;
+        send_interaction_caps(
+            writer_stream.as_mut(),
+            cfg.share_root.is_some() && !cfg.view_only,
+        )?;
     }
 
     // --- ARD encrypted frame channel (experimental, extended-init clients) ---
@@ -243,8 +258,7 @@ pub fn handle_client(
                 .unwrap_or(0);
             let reset = std::env::var_os("RESTSEND_VNC_APPLE_CBC_RESET").is_some();
             pending_cipher = Some(
-                crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, seq0)
-                    .with_iv_reset(reset),
+                crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, seq0).with_iv_reset(reset),
             );
         }
     }
@@ -397,10 +411,13 @@ pub fn handle_client(
     }
     session.apple_info_sent = true;
 
-    let result = match trace_path
-        .as_ref()
-        .and_then(|p| std::fs::OpenOptions::new().create(true).append(true).open(p).ok())
-    {
+    let result = match trace_path.as_ref().and_then(|p| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+    }) {
         Some(mut file) => {
             let mut tee = TeeReader {
                 inner: &mut reader,
@@ -477,7 +494,8 @@ fn writer_loop(
     budget: Arc<ByteBudget>,
 ) {
     let mut cipher: Option<crate::rfb::apple_auth::AppleStreamCipher> = None;
-    while let Ok(msg) = rx.recv() {        let ok = match msg {
+    while let Ok(msg) = rx.recv() {
+        let ok = match msg {
             OutMsg::Activate(c) => {
                 cipher = Some(c);
                 true
@@ -664,7 +682,7 @@ struct Updater {
     /// A frame update overlapped the cursor; repaint it.
     cursor_need_repaint: bool,
     /// FBUR counter (diagnostics for the Apple FBUR-driven path).
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[allow(dead_code)]
     pub fbur_seen: u64,
 }
 
@@ -735,10 +753,11 @@ impl Updater {
             let cursor_only = !frame_dirty && (cursor_dirty || self.cursor_need_repaint);
 
             if frame_dirty && self.frame_budget.has_capacity() {
-                let incremental = !first && self.cached.dims() == {
-                    let snap = self.state.snapshot();
-                    snap.dims()
-                };
+                let incremental = !first
+                    && self.cached.dims() == {
+                        let snap = self.state.snapshot();
+                        snap.dims()
+                    };
                 let t0 = Instant::now();
                 if std::env::var_os("RESTSEND_VNC_NO_FRAMES").is_some() {
                     // Experiment: keep the session alive without frames.
@@ -898,8 +917,7 @@ impl Updater {
             match self.tx.try_send(slot.take().expect("send slot occupied")) {
                 Ok(()) => {
                     self.queue_depth.fetch_add(1, Ordering::Relaxed);
-                    self.frame_budget
-                        .release(reserved.saturating_sub(len));
+                    self.frame_budget.release(reserved.saturating_sub(len));
                     return Ok(());
                 }
                 Err(TrySendError::Full(m)) => {
@@ -993,7 +1011,12 @@ impl Updater {
         // Split oversized rects into strips to bound per-rect encode time.
         let mut expanded: Vec<Rect> = Vec::new();
         for r in rects.drain(..) {
-            split_rect(&mut expanded, r, encoder.bytes_per_pixel().max(1), MAX_RECT_RAW);
+            split_rect(
+                &mut expanded,
+                r,
+                encoder.bytes_per_pixel().max(1),
+                MAX_RECT_RAW,
+            );
         }
         rects = expanded;
 
@@ -1096,8 +1119,7 @@ impl Updater {
                         let scaled = shape.scaled(scale);
                         let w = scaled.width as usize;
                         let h = scaled.height as usize;
-                        let estimate =
-                            16 + w * h * encoder.bytes_per_pixel() + ((w + 7) / 8) * h;
+                        let estimate = 16 + w * h * encoder.bytes_per_pixel() + w.div_ceil(8) * h;
                         (rich_cursor_message(&scaled, &encoder), estimate)
                     }
                     _ => (hidden_cursor_message(), 16),
@@ -1187,12 +1209,7 @@ impl Updater {
             let tile = if draw_cursor {
                 overlay_frame(&frame, rect, snap, scale)
             } else {
-                frame.subframe(
-                    rect.x as u32,
-                    rect.y as u32,
-                    rect.w as u32,
-                    rect.h as u32,
-                )
+                frame.subframe(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32)
             };
             let mut payload = rect_header(rect.x, rect.y, rect.w, rect.h, encoding.code());
             if let Err(e) = encode_rect(
@@ -1327,10 +1344,8 @@ impl Session {
                     let mut st = self.enc.lock().unwrap();
                     // Escape hatch for clients that advertise the pseudo-
                     // encoding but do not actually draw the local cursor.
-                    let force_server =
-                        std::env::var_os("RESTSEND_VNC_CURSOR_SERVER").is_some();
-                    st.cursor_rich =
-                        !force_server && encodings.contains(&pseudo::RICH_CURSOR);
+                    let force_server = std::env::var_os("RESTSEND_VNC_CURSOR_SERVER").is_some();
+                    st.cursor_rich = !force_server && encodings.contains(&pseudo::RICH_CURSOR);
                     // The viewer already knows where its own pointer is.
                     // Echoing PointerPos at 60 Hz is redundant and some
                     // clients repaint badly when it interleaves with frame
@@ -1369,7 +1384,10 @@ impl Session {
                 // the configured fps; FBURs need no action.
             }
             ClientMessage::KeyEvent { down, keysym } => {
-                tracing::debug!("{peer}: key {keysym:#06x} {}", if down { "down" } else { "up" });
+                tracing::debug!(
+                    "{peer}: key {keysym:#06x} {}",
+                    if down { "down" } else { "up" }
+                );
                 self.apply_key(keysym, down);
             }
             ClientMessage::PointerEvent { mask, x, y } => {
@@ -1446,13 +1464,12 @@ impl Session {
     }
 
     fn ensure_input(&mut self) {
-        if self.input.is_none()
-            && self.screen_dims != (0, 0) {
-                self.input = Some(InputBackend::for_platform(
-                    self.screen_dims.0,
-                    self.screen_dims.1,
-                ));
-            }
+        if self.input.is_none() && self.screen_dims != (0, 0) {
+            self.input = Some(InputBackend::for_platform(
+                self.screen_dims.0,
+                self.screen_dims.1,
+            ));
+        }
     }
 
     /// Applies a key event (shared by standard RFB and Apple clients).
@@ -1485,10 +1502,7 @@ impl Session {
         // toggle the debug overlay.
         let left_pressed = mask & 1 != 0 && self.last_mask & 1 == 0;
         self.last_mask = mask;
-        if left_pressed
-            && self.ctrl_held
-            && crate::settings::ALLOW_DEBUG.load(Ordering::Relaxed)
-        {
+        if left_pressed && self.ctrl_held && crate::settings::ALLOW_DEBUG.load(Ordering::Relaxed) {
             let fresh = self
                 .cheat_at
                 .map(|t| t.elapsed() <= Duration::from_secs(2))
@@ -1540,7 +1554,10 @@ impl Session {
             let x = u16::from_be_bytes([p[12], p[13]]);
             let y = u16::from_be_bytes([p[14], p[15]]);
             let mask = apple_button_mask(p[11]);
-            tracing::trace!("apple pointer {x},{y} buttons={:#04x} (subtype {subtype})", p[11]);
+            tracing::trace!(
+                "apple pointer {x},{y} buttons={:#04x} (subtype {subtype})",
+                p[11]
+            );
             self.apply_pointer(x, y, mask);
         } else {
             let hex: String = p.iter().map(|b| format!("{b:02x}")).collect();
@@ -1625,14 +1642,20 @@ impl Session {
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => {
-                return self
-                    .send(filetransfer::download_failed_message(&format!("open failed: {e}")))
+                return self.send(filetransfer::download_failed_message(&format!(
+                    "open failed: {e}"
+                )))
             }
         };
         if position > 0 {
             use std::io::Seek;
-            if file.seek(std::io::SeekFrom::Start(position as u64)).is_err() {
-                return self.send(filetransfer::download_failed_message("invalid resume position"));
+            if file
+                .seek(std::io::SeekFrom::Start(position as u64))
+                .is_err()
+            {
+                return self.send(filetransfer::download_failed_message(
+                    "invalid resume position",
+                ));
             }
         }
         tracing::info!("FT download: {} (resume at {position})", path.display());
@@ -1650,8 +1673,9 @@ impl Session {
                     }
                 }
                 Err(e) => {
-                    return self
-                        .send(filetransfer::download_failed_message(&format!("read error: {e}")))
+                    return self.send(filetransfer::download_failed_message(&format!(
+                        "read error: {e}"
+                    )))
                 }
             }
         }
@@ -1715,7 +1739,6 @@ impl Session {
             Err(e) => tracing::warn!("FT mkdir rejected: {e}"),
         }
     }
-
 }
 
 /// Converts an Apple Screen Sharing button mask to RFB/X11 order.
@@ -1742,8 +1765,6 @@ fn apple_button_mask(mask: u8) -> u8 {
     }
     out
 }
-
-
 
 #[cfg(test)]
 mod throttle_tests {

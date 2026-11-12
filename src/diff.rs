@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn far_apart_changes_are_not_merged() {
-        let mut cached = Frame::new(512, 128);
+        let cached = Frame::new(512, 128);
         let mut current = Frame::new(512, 128);
         for y in 0..16 {
             for x in [0usize, 400] {

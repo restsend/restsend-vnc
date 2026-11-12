@@ -81,8 +81,8 @@ fn run(state: Arc<ScreenState>) {
 #[cfg(target_os = "windows")]
 fn is_locked() -> bool {
     use windows::Win32::System::RemoteDesktop::{
-        WTSQuerySessionInformationW, WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
-        WTS_INFO_CLASS, WTSFreeMemory,
+        WTSFreeMemory, WTSQuerySessionInformationW, WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+        WTS_INFO_CLASS,
     };
 
     // WTSSessionInfoEx == 25; Level1.SessionFlags sits at buffer offset 12.
@@ -138,8 +138,8 @@ fn render(w: u32, h: u32) -> Frame {
 
     let w = f.width;
     let h = f.height;
-    let panel_w = (w * 3 / 4).min(1100).max(420);
-    let panel_h = (h / 3).min(300).max(180);
+    let panel_w = (w * 3 / 4).clamp(420, 1100);
+    let panel_h = (h / 3).clamp(180, 300);
     let px = (w - panel_w) / 2;
     let py = (h - panel_h) / 2;
     font::fill_rect(&mut f, px, py, panel_w, panel_h, PANEL);
@@ -181,7 +181,15 @@ fn render(w: u32, h: u32) -> Frame {
     f
 }
 
-fn draw_centered(f: &mut Frame, panel_x: u32, panel_w: u32, y: u32, text: &str, scale: u32, color: [u8; 4]) {
+fn draw_centered(
+    f: &mut Frame,
+    panel_x: u32,
+    panel_w: u32,
+    y: u32,
+    text: &str,
+    scale: u32,
+    color: [u8; 4],
+) {
     let total = font::text_width(text, scale);
     let x = panel_x + panel_w.saturating_sub(total) / 2;
     font::draw_text(f, x, y, text, scale, color);

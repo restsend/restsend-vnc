@@ -81,7 +81,10 @@ impl ShareRoot {
         while !anc.exists() {
             match (anc.parent(), remainder.parent().map(|_| ())) {
                 (Some(p), _) if p != anc => {
-                    remainder = anc.file_name().map(|f| remainder.join(f)).unwrap_or(remainder);
+                    remainder = anc
+                        .file_name()
+                        .map(|f| remainder.join(f))
+                        .unwrap_or(remainder);
                     anc = p.to_path_buf();
                 }
                 _ => {
@@ -312,7 +315,8 @@ mod tests {
             }
         }
         pub fn make() -> TempDirGuard {
-            let base = std::env::temp_dir().join(format!("restsend-vnc-test-{}", std::process::id()));
+            let base =
+                std::env::temp_dir().join(format!("restsend-vnc-test-{}", std::process::id()));
             // Nanosecond timestamps can collide when tests run in parallel.
             let path = base.join(format!(
                 "t-{}-{}",

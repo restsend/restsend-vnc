@@ -1,6 +1,6 @@
 [package]
 name = "restsend-vnc"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "A headless, cross-platform (macOS/Windows) VNC server CLI"
 license = "MIT"
@@ -57,6 +57,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Controls",
     "Win32_System_Registry",
     "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
 ] }
 
 [profile.release]

@@ -243,7 +243,13 @@ mod tests {
                         pal.push(inflated[pos..pos + cpix].to_vec());
                         pos += cpix;
                     }
-                    let bits = if n <= 2 { 1 } else if n <= 4 { 2 } else { 4 };
+                    let bits = if n <= 2 {
+                        1
+                    } else if n <= 4 {
+                        2
+                    } else {
+                        4
+                    };
                     let mut bitbuf: u32 = 0;
                     let mut nbits: u32 = 0;
                     for _ in 0..TILE * TILE {

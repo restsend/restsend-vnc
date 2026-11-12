@@ -37,7 +37,7 @@ pub fn spawn(
             {
                 // Watchdog: draw a lock notice while the workstation is locked.
                 let _ = locked::spawn(std::sync::Arc::clone(&state));
-                return desktop::spawn(display_index, fps.max(1), state);
+                desktop::spawn(display_index, fps.max(1), state)
             }
             #[cfg(not(target_os = "windows"))]
             {

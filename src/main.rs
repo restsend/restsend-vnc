@@ -1,8 +1,14 @@
 //! rvnc — a headless VNC server CLI for Windows.
-#![cfg_attr(all(target_os = "windows", feature = "gui"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", feature = "gui"),
+    windows_subsystem = "windows"
+)]
 //!
 //! See README.md for usage notes.
 
+mod approval;
+mod audit;
+mod autostart;
 mod awake;
 mod clipboard;
 mod config;
@@ -14,22 +20,20 @@ mod input;
 mod rfb;
 mod screen;
 mod server;
+mod session;
 mod settings;
-mod autostart;
-mod audit;
+mod throttle;
 mod tls;
 mod transport;
 #[cfg(target_os = "windows")]
 mod tray;
-mod session;
-mod throttle;
 
 use std::io::IsTerminal;
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use config::{Config, Cli};
 use clap::Parser;
+use config::{Cli, Config};
 
 fn main() {
     let cli = Cli::parse();
@@ -79,7 +83,11 @@ fn main() {
 
     tracing::info!(
         "starting {} build {} (settings: {})",
-        if cfg!(feature = "gui") { "GUI" } else { "console" },
+        if cfg!(feature = "gui") {
+            "GUI"
+        } else {
+            "console"
+        },
         env!("BUILD_TIME"),
         settings::settings_path().display()
     );
@@ -106,7 +114,10 @@ fn main() {
     let file_settings = settings::load();
     if !settings::settings_path().exists() {
         settings::save(&file_settings);
-        tracing::info!("created default settings at {}", settings::settings_path().display());
+        tracing::info!(
+            "created default settings at {}",
+            settings::settings_path().display()
+        );
     }
     let mut effective = file_settings.clone();
     if cfg.port != 5900 {
@@ -117,6 +128,9 @@ fn main() {
     }
     if cfg.keep_awake {
         effective.keep_awake = true;
+    }
+    if let Some(confirm) = cfg.confirm {
+        effective.confirm_connections = confirm;
     }
     if cfg.debug {
         effective.allow_debug = true;
@@ -135,10 +149,11 @@ fn main() {
     }
     settings::apply_live(&effective);
     tracing::info!(
-        "settings: port={} color={} loopback_only={} keep_awake={} allow_debug={} tls={} url={}",
+        "settings: port={} color={} loopback_only={} confirm_connections={} keep_awake={} allow_debug={} tls={} url={}",
         effective.port,
         effective.color_level,
         effective.loopback_only,
+        effective.confirm_connections,
         effective.keep_awake,
         effective.allow_debug,
         effective.tls,
@@ -271,8 +286,14 @@ fn main() {
         let flags = [
             ("view-only", cfg.view_only),
             ("clipboard", cfg.clipboard_enabled && !cfg.view_only),
-            ("file-transfer", !cfg.view_only && (cfg.share_root.is_some() || settings::share_files())),
-            ("keep-awake", settings::KEEP_AWAKE.load(std::sync::atomic::Ordering::Relaxed)),
+            (
+                "file-transfer",
+                !cfg.view_only && (cfg.share_root.is_some() || settings::share_files()),
+            ),
+            (
+                "keep-awake",
+                settings::KEEP_AWAKE.load(std::sync::atomic::Ordering::Relaxed),
+            ),
         ]
         .into_iter()
         .filter_map(|(k, on)| on.then_some(k.to_string()))
@@ -312,7 +333,6 @@ fn display_host(host: &str) -> &str {
     }
 }
 
-
 /// True when the process token is elevated (running "as administrator").
 #[cfg(target_os = "windows")]
 fn is_elevated() -> bool {
@@ -341,7 +361,6 @@ fn is_elevated() -> bool {
     }
 }
 
-
 /// Samples process CPU/RSS once per second for the debug overlay.
 fn spawn_sys_sampler(state: Arc<framebuffer::ScreenState>) {
     std::thread::Builder::new()
@@ -361,13 +380,14 @@ fn spawn_sys_sampler(state: Arc<framebuffer::ScreenState>) {
         .ok();
 }
 
-
 /// Windows named mutex: only one rvnc process per machine/session.
 #[cfg(target_os = "windows")]
 fn single_instance_ok() -> bool {
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
-    let name: Vec<u16> = "Global\\restsend_vnc_single_instance\0".encode_utf16().collect();
+    let name: Vec<u16> = "Global\\restsend_vnc_single_instance\0"
+        .encode_utf16()
+        .collect();
     match unsafe { CreateMutexW(None, true, windows::core::PCWSTR(name.as_ptr())) } {
         Ok(_) => unsafe { GetLastError() != ERROR_ALREADY_EXISTS },
         Err(_) => true,
@@ -398,7 +418,6 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogFile {
     }
 }
 
-
 /// Shows a message box in GUI builds and prints to stderr otherwise.
 fn fatal_dialog(msg: &str) {
     tracing::error!("{msg}");
@@ -420,7 +439,6 @@ fn fatal_dialog(msg: &str) {
         eprintln!("error: {msg}");
     }
 }
-
 
 /// Creates/removes a logon scheduled task with highest privileges (the
 /// practical equivalent of a service for screen capture, which cannot run in

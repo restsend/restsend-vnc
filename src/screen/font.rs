@@ -2,11 +2,12 @@
 
 use crate::framebuffer::Frame;
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn fill(frame: &mut Frame, color: [u8; 4]) {
     let stride = frame.stride();
     for y in 0..frame.height as usize {
         let row = &mut frame.bgra[y * stride..y * stride + frame.width as usize * 4];
-        for px in row.chunks_exact_mut(4) {
+        for px in row.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&color);
         }
     }
@@ -20,7 +21,7 @@ pub fn fill_rect(frame: &mut Frame, x: u32, y: u32, w: u32, h: u32, color: [u8; 
     let y1 = (y + h).min(frame.height) as usize;
     for yy in y0..y1 {
         let row = &mut frame.bgra[yy * stride..yy * stride + frame.width as usize * 4];
-        for px in row[x0 * 4..x1 * 4].chunks_exact_mut(4) {
+        for px in row[x0 * 4..x1 * 4].as_chunks_mut::<4>().0 {
             px.copy_from_slice(&color);
         }
     }
@@ -31,14 +32,7 @@ pub fn text_width(text: &str, scale: u32) -> u32 {
 }
 
 /// Draws `text` at (x, y); returns the advance width in pixels.
-pub fn draw_text(
-    frame: &mut Frame,
-    x: u32,
-    y: u32,
-    text: &str,
-    scale: u32,
-    color: [u8; 4],
-) -> u32 {
+pub fn draw_text(frame: &mut Frame, x: u32, y: u32, text: &str, scale: u32, color: [u8; 4]) -> u32 {
     let scale = scale.max(1);
     let mut cx = x;
     for ch in text.chars() {

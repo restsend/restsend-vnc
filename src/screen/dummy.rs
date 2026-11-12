@@ -27,7 +27,12 @@ fn run(fps: u32, state: Arc<ScreenState>) {
     while !state.is_stopped() {
         let now = Instant::now();
         let echo = state.echo.lock().unwrap().clone();
-        render(&mut frame, now.duration_since(start).as_secs_f64(), frame_no, &echo);
+        render(
+            &mut frame,
+            now.duration_since(start).as_secs_f64(),
+            frame_no,
+            &echo,
+        );
         state.publish_capture(frame.clone());
         frame_no += 1;
         let elapsed = now.elapsed();

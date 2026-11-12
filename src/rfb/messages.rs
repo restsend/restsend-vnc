@@ -95,7 +95,8 @@ pub enum ClientMessage {
         compressed_level: u8,
         position: u32,
         file_name: String,
-    },    FileUploadData {
+    },
+    FileUploadData {
         compressed_level: u8,
         payload: UploadPayload,
     },
@@ -277,11 +278,16 @@ pub fn read_client_message(r: &mut impl Read, ft_enabled: bool) -> io::Result<Cl
             let compressed_size = read_u16(r)?;
             let payload = if real_size == 0 && compressed_size == 0 {
                 // EOF marker carrying the client-side mtime (unix seconds)
-                UploadPayload::Eof { mtime: read_u32(r)? }
+                UploadPayload::Eof {
+                    mtime: read_u32(r)?,
+                }
             } else {
                 let mut buf = vec![0u8; compressed_size as usize];
                 r.read_exact(&mut buf)?;
-                UploadPayload::Chunk { real_size, data: buf }
+                UploadPayload::Chunk {
+                    real_size,
+                    data: buf,
+                }
             };
             ClientMessage::FileUploadData {
                 compressed_level,
@@ -293,7 +299,10 @@ pub fn read_client_message(r: &mut impl Read, ft_enabled: bool) -> io::Result<Cl
             r.read_exact(&mut pad)?;
             let len = read_u16(r)? as usize;
             if len > MAX_STRING_LEN {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "reason too long"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "reason too long",
+                ));
             }
             let reason = read_string(r, len)?;
             if msg_type == ft::FILE_DOWNLOAD_CANCEL {
@@ -409,7 +418,8 @@ mod tests {
     fn parse_pointer_event() {
         let data = [5u8, 0b101, 0x01, 0x02, 0x00, 0x10].to_vec();
         let mut c = Cursor::new(data);
-        let ClientMessage::PointerEvent { mask, x, y } = read_client_message(&mut c, false).unwrap()
+        let ClientMessage::PointerEvent { mask, x, y } =
+            read_client_message(&mut c, false).unwrap()
         else {
             panic!("wrong variant");
         };

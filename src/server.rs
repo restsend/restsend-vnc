@@ -25,6 +25,7 @@ pub fn unregister_session(id: u64) {
     SESSIONS.lock().unwrap().retain(|(sid, _)| *sid != id);
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub fn kill_all_sessions() -> usize {
     let sessions = SESSIONS.lock().unwrap();
     for (_, s) in sessions.iter() {
@@ -77,10 +78,7 @@ pub fn serve(
         // `--share-dir` overrides the tray setting for this run; otherwise the
         // live setting is evaluated per connection so toggling it in the tray
         // applies without restarting.
-        let share_root = cfg
-            .share_root
-            .clone()
-            .or_else(crate::settings::share_root);
+        let share_root = cfg.share_root.clone().or_else(crate::settings::share_root);
         let cfg = SessionConfig {
             name: crate::settings::title(),
             view_only: cfg.view_only,

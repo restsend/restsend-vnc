@@ -11,10 +11,11 @@ Works with standard VNC viewers and with macOS built-in Screen Sharing.
 - Standard clipboard sync, both directions (text)
 - TLS via VeNCrypt (RFB security type 19), self-signed certificate generated on first use; works with TigerVNC and other VeNCrypt viewers
 - File transfer via Tight extensions (upload/download/resume/mkdir), off by default and sandboxed to the configured shared folder (defaults to your user directory)
-- Tray icon + native settings window: port, colour level, password, title, loopback-only, keep-awake, debug panel, shared folder
+- Tray icon + native tabbed settings window (General / Security / Files): port, colour level, password, title, loopback-only, keep-awake, debug panel, shared folder, encryption
+- Optional manual connection approval: every authenticated connection can require a local Accept/Reject click; no screen data is sent before approval, and unanswered requests are rejected after 30 seconds
 - macOS Screen Sharing: RFB 003.889 + Apple DH (type 30) auth, video/input, lock-screen notice
 - Debug overlay (fps, throughput, encode time, CPU, memory, versions) — toggle with `Ctrl + 3 left clicks`
-- Session audit log (client version, connect time, disconnect reason, duration)
+- Session audit log (client version, connect time, disconnect reason, duration, confirmation pending/accept/reject/timeout)
 - Single instance; renders a notice while the Windows session is locked
 
 ## Download
@@ -58,7 +59,8 @@ Default listen address is `0.0.0.0`. Enable **Only accept loopback connections**
 - Config file: `%APPDATA%\restsend-vnc\settings.ini` (written by the tray)
 - Command-line flags apply to the current run only, are never written to the config file, and override it
 - File transfer is **off by default**. Enable **Share files** in Settings and choose a shared folder (defaults to your user directory); new connections pick the change up immediately. `--share-dir <DIR>` enables it for the current run only
-- Common flags: `--port`, `--password`, `--host`, `--color-level 8|16|24`, `--fps`, `--scale`, `--share-dir`, `--debug`, `--tls`
+- Connection confirmation is **off by default**. Enable **Ask before accepting incoming connections** on the Security tab (or pass `--confirm`) to require a local Accept click for each new connection. The prompt appears after authentication and before `ServerInit`; rejected, timed-out (30 s) or unattended requests are closed without sending any screen data. At most 4 requests are queued; further connections are refused. Use `--no-confirm` to override the persisted setting for one run
+- Common flags: `--port`, `--password`, `--host`, `--color-level 8|16|24`, `--fps`, `--scale`, `--share-dir`, `--debug`, `--tls`, `--confirm`, `--no-confirm`
 
 ## TLS / VeNCrypt
 
@@ -104,6 +106,8 @@ Artifact: `target/x86_64-pc-windows-gnu/release/restsend-vnc.exe`
 ## Notes
 
 - Elevated windows (Task Manager, UAC) require running as administrator (Windows UIPI)
+- Connection confirmation fails closed: a console build prompts on stdin, and rejects the connection when no terminal/UI is available
+- Internal test hooks: `RESTSEND_VNC_APPROVAL=accept|reject|timeout` and `RESTSEND_VNC_APPROVAL_TIMEOUT_MS` bypass the prompt when confirmation is enabled (used by `tests/approval_smoke.rs`)
 - Apple clients only allow shared clipboard on encrypted ARD sessions
 - The debug overlay's `CLI` line ends in `[TLS]` or `[PLAIN]` so the live link's encryption is visible
 - The password is stored in plain text in `settings.ini`

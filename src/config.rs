@@ -104,6 +104,15 @@ pub struct Cli {
     #[arg(long, value_name = "PEM")]
     pub tls_key: Option<PathBuf>,
 
+    /// Ask the local user to accept each incoming connection. Overrides the
+    /// persisted tray setting for this run only.
+    #[arg(long)]
+    pub confirm: bool,
+
+    /// Disable the incoming-connection confirmation prompt for this run.
+    #[arg(long)]
+    pub no_confirm: bool,
+
     /// Prevent Windows from sleeping while rvnc runs (disabled by default)
     #[arg(long)]
     pub keep_awake: bool,
@@ -140,6 +149,8 @@ pub struct Config {
     pub share_root: Option<Arc<ShareRoot>>,
     pub clipboard_enabled: bool,
     pub keep_awake: bool,
+    /// CLI override for the persisted connection-confirmation setting.
+    pub confirm: Option<bool>,
     /// CLI override for the persisted encryption policy.
     pub tls: Option<crate::tls::Mode>,
     pub tls_cert: Option<PathBuf>,
@@ -173,8 +184,10 @@ impl Config {
         } else if let Some(p) = crate::settings::load().password {
             Some(p)
         } else if std::io::stdin().is_terminal() {
-            Some(rpassword::prompt_password("Set VNC password (max 8 chars used): ")
-                .map_err(|e| format!("failed to read password: {e}"))?)
+            Some(
+                rpassword::prompt_password("Set VNC password (max 8 chars used): ")
+                    .map_err(|e| format!("failed to read password: {e}"))?,
+            )
         } else if cfg!(feature = "gui") {
             // GUI build has no terminal to prompt on; run without auth rather
             // than exiting silently (the tray/log will warn).
@@ -195,11 +208,9 @@ impl Config {
         }
 
         let share_root = match &cli.share_dir {
-            Some(dir) => Some(Arc::new(
-                ShareRoot::new(dir).map_err(|e| {
-                    format!("--share-dir {} is not usable: {e}", dir.display())
-                })?),
-            ),
+            Some(dir) => Some(Arc::new(ShareRoot::new(dir).map_err(|e| {
+                format!("--share-dir {} is not usable: {e}", dir.display())
+            })?)),
             None => None,
         };
         if cli.share_dir.is_none() {
@@ -210,6 +221,10 @@ impl Config {
 
         if cli.tls_cert.is_some() != cli.tls_key.is_some() {
             return Err("--tls-cert and --tls-key must be provided together".into());
+        }
+
+        if cli.confirm && cli.no_confirm {
+            return Err("--confirm and --no-confirm cannot be used together".into());
         }
 
         Ok(Config {
@@ -224,7 +239,10 @@ impl Config {
             scale: if (0.25..=1.0).contains(&cli.scale) {
                 cli.scale
             } else {
-                return Err(format!("--scale must be between 0.25 and 1.0 (got {})", cli.scale));
+                return Err(format!(
+                    "--scale must be between 0.25 and 1.0 (got {})",
+                    cli.scale
+                ));
             },
             color_level: match cli.color_level {
                 8 | 16 | 24 => cli.color_level,
@@ -235,6 +253,13 @@ impl Config {
             share_root,
             clipboard_enabled: !cli.no_clipboard,
             keep_awake: cli.keep_awake,
+            confirm: if cli.confirm {
+                Some(true)
+            } else if cli.no_confirm {
+                Some(false)
+            } else {
+                None
+            },
             tls: cli.tls,
             tls_cert: cli.tls_cert,
             tls_key: cli.tls_key,

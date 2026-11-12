@@ -72,9 +72,11 @@ pub fn enabled() -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 pub fn set(_enabled: bool) {}
 
 #[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
 pub fn enabled() -> bool {
     false
 }

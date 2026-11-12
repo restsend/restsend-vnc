@@ -6,31 +6,38 @@
 
 #![cfg(target_os = "windows")]
 
+use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::atomic::Ordering as AtomicOrdering;
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::time::Instant;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, ShellExecuteW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW,
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, SHBrowseForFolderW,
-    SHGetPathFromIDListW,
-};
 use windows::Win32::Graphics::Gdi::{
-    CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, COLOR_WINDOW, CreateFontW, DEFAULT_CHARSET,
-    DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HBRUSH, OUT_DEFAULT_PRECIS,
+    CreateFontW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET,
+    DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HBRUSH, HFONT, OUT_DEFAULT_PRECIS,
 };
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    CheckDlgButton, DLG_BUTTON_CHECK_STATE, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES,
-    INITCOMMONCONTROLSEX, InitCommonControlsEx, IsDlgButtonChecked,
+    CheckDlgButton, InitCommonControlsEx, IsDlgButtonChecked, DLG_BUTTON_CHECK_STATE,
+    ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR,
+    TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL, TCN_SELCHANGE,
+    WC_TABCONTROLW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Shell::{
+    SHBrowseForFolderW, SHGetPathFromIDListW, ShellExecuteW, Shell_NotifyIconW, BIF_NEWDIALOGSTYLE,
+    BIF_RETURNONLYFSDIRS, BROWSEINFOW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NOTIFYICONDATAW,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_TRAY: u32 = WM_APP + 1;
+const TIMER_APPROVAL: usize = 1;
 const ID_SETTINGS: usize = 1;
 const ID_KILL: usize = 2;
 const ID_OPEN: usize = 3;
@@ -51,8 +58,24 @@ const C_SHARE_DIR: i32 = 1012;
 // Keep control IDs unique: combo-box notifications also arrive as WM_COMMAND.
 const C_BROWSE: i32 = 1013;
 const C_TLS: i32 = 1014;
+const C_CONFIRM: i32 = 1015;
+const C_TABS: i32 = 1020;
+
+const C_CC_COUNT: i32 = 1031;
+const C_CC_ACCEPT: i32 = 1032;
+const C_CC_REJECT: i32 = 1033;
 
 static UI_FONT: AtomicIsize = AtomicIsize::new(0);
+/// Non-zero while the settings window is open (prevents nested duplicates).
+static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Non-zero while the confirmation window is on screen.
+static CONFIRM_ID: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Control handles per settings tab, stored as `isize` because `HWND`
+    /// itself is not `Send`/`Sync`.
+    static SETTINGS_PAGES: RefCell<Vec<Vec<isize>>> = const { RefCell::new(Vec::new()) };
+}
 
 pub fn spawn() {
     // Common Controls v6 (themed buttons/edits) — paired with the embedded
@@ -60,7 +83,7 @@ pub fn spawn() {
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES,
+            dwICC: ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_TAB_CLASSES,
         };
         let _ = InitCommonControlsEx(&icc);
     }
@@ -109,12 +132,9 @@ unsafe fn run() {
         uID: 1,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: WM_TRAY,
-        hIcon: LoadIconW(
-            Some(hinst.into()),
-            PCWSTR(1 as *const u16),
-        )
-        .or_else(|_| LoadIconW(None, IDI_APPLICATION))
-        .unwrap_or_default(),
+        hIcon: LoadIconW(Some(hinst.into()), PCWSTR(std::ptr::without_provenance(1)))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+            .unwrap_or_default(),
         ..Default::default()
     };
     let tip = wide("restsend-vnc - VNC server");
@@ -124,19 +144,35 @@ unsafe fn run() {
         std::ptr::copy_nonoverlapping(tip.as_ptr(), dst, n);
     }
     let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+    // Poll the approval queue; a timer keeps the tray window responsive while
+    // the modal settings window runs its own message loop.
+    let _ = SetTimer(Some(hwnd), TIMER_APPROVAL, 200, None);
 
     let mut msg = MSG::default();
-    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+    loop {
+        if crate::settings::EXIT.load(Ordering::Relaxed) {
+            break;
+        }
+        if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            break;
+        }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    let _ = KillTimer(Some(hwnd), TIMER_APPROVAL);
+    crate::approval::reject_all();
     let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
     if crate::settings::EXIT.load(Ordering::Relaxed) {
         std::process::exit(0);
     }
 }
 
-unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn tray_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_TRAY => {
             let ev = lparam.0 as u32;
@@ -145,34 +181,28 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings..."));
                 let _ = AppendMenuW(menu, MF_STRING, ID_KILL, w!("Disconnect all sessions"));
                 let url = wide(&crate::settings::url());
-                let _ = AppendMenuW(
-                    menu,
-                    MF_STRING,
-                    ID_OPEN,
-                    PCWSTR(url.as_ptr()),
-                );
+                let _ = AppendMenuW(menu, MF_STRING, ID_OPEN, PCWSTR(url.as_ptr()));
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                 let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, w!("About restsend-vnc"));
                 let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
                 let mut pt = POINT::default();
                 let _ = GetCursorPos(&mut pt);
                 let _ = SetForegroundWindow(hwnd);
-                let _ = TrackPopupMenu(
-                    menu,
-                    TPM_RIGHTBUTTON,
-                    pt.x,
-                    pt.y,
-                    Some(0),
-                    hwnd,
-                    None,
-                );
+                let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, Some(0), hwnd, None);
                 let _ = DestroyMenu(menu);
             }
         }
         WM_COMMAND => {
             let id = wparam.0 & 0xffff;
             match id {
-                ID_SETTINGS => open_settings(),
+                ID_SETTINGS => {
+                    let existing = SETTINGS_HWND.load(Ordering::Relaxed);
+                    if existing != 0 {
+                        let _ = SetForegroundWindow(HWND(existing as *mut core::ffi::c_void));
+                    } else {
+                        open_settings();
+                    }
+                }
                 ID_KILL => {
                     let n = crate::server::kill_all_sessions();
                     tracing::info!("tray: disconnected {n} session(s)");
@@ -204,18 +234,28 @@ unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     );
                 }
                 ID_EXIT => {
+                    crate::approval::reject_all();
                     crate::settings::EXIT.store(true, Ordering::Relaxed);
-                    let _ = PostQuitMessage(0);
+                    PostQuitMessage(0);
                 }
                 _ => {}
             }
         }
-        WM_DESTROY => PostQuitMessage(0),
+        WM_TIMER => {
+            if wparam.0 == TIMER_APPROVAL {
+                poll_approval();
+            }
+        }
+        WM_DESTROY => {
+            crate::approval::reject_all();
+            PostQuitMessage(0);
+        }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn ctrl(
     parent: HWND,
     class: PCWSTR,
@@ -239,7 +279,9 @@ unsafe fn ctrl(
         h,
         Some(parent),
         Some(HMENU(id as isize as *mut core::ffi::c_void)),
-        Some(windows::Win32::Foundation::HINSTANCE(hinst as *mut core::ffi::c_void)),
+        Some(windows::Win32::Foundation::HINSTANCE(
+            hinst as *mut core::ffi::c_void,
+        )),
         None,
     )
     .unwrap_or_default();
@@ -248,6 +290,241 @@ unsafe fn ctrl(
         SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(f as usize)), Some(LPARAM(1)));
     }
     hwnd
+}
+
+unsafe fn ensure_ui_font(scale: f32) -> HFONT {
+    let existing = UI_FONT.load(AtomicOrdering::Relaxed);
+    if existing != 0 {
+        return HFONT(existing as *mut core::ffi::c_void);
+    }
+    let px = ((15.0 * scale).round() as i32).max(9);
+    let font = CreateFontW(
+        -px,
+        0,
+        0,
+        0,
+        FW_NORMAL.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+        w!("Segoe UI"),
+    );
+    UI_FONT.store(font.0 as isize, AtomicOrdering::Relaxed);
+    font
+}
+
+unsafe fn show_settings_page(index: usize) {
+    SETTINGS_PAGES.with(|pages| {
+        let pages = pages.borrow();
+        for (i, group) in pages.iter().enumerate() {
+            let cmd = if i == index { SW_SHOW } else { SW_HIDE };
+            for &h in group {
+                let _ = ShowWindow(HWND(h as *mut core::ffi::c_void), cmd);
+            }
+        }
+    });
+}
+
+/// Called by the tray timer: show the next pending connection request.
+unsafe fn poll_approval() {
+    if CONFIRM_ID.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let Some(pending) = crate::approval::front_pending() else {
+        return;
+    };
+    if !crate::approval::is_pending(pending.id) {
+        return;
+    }
+    show_confirm(&pending);
+}
+
+unsafe fn show_confirm(pending: &crate::approval::PendingView) {
+    let hinst = GetModuleHandleW(None).unwrap();
+    let class = w!("restsend_vnc_confirm_wnd");
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(confirm_proc),
+        hInstance: hinst.into(),
+        lpszClassName: class,
+        hbrBackground: HBRUSH((COLOR_WINDOW.0 as isize + 1) as *mut core::ffi::c_void),
+        ..Default::default()
+    };
+    RegisterClassW(&wc);
+
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    let dpi = GetDpiForSystem() as f32;
+    let scale = (dpi / 96.0).max(1.0);
+    let f = |v: i32| ((v as f32) * scale).round() as i32;
+    ensure_ui_font(scale);
+
+    let mut wr = RECT {
+        left: 0,
+        top: 0,
+        right: f(460),
+        bottom: f(240),
+    };
+    let _ = AdjustWindowRectEx(&mut wr, style, false, WS_EX_TOPMOST);
+    let screen_w = GetSystemMetrics(SM_CXSCREEN);
+    let screen_h = GetSystemMetrics(SM_CYSCREEN);
+    let width = wr.right - wr.left;
+    let height = wr.bottom - wr.top;
+    let x = ((screen_w - width) / 2).max(0);
+    let y = ((screen_h - height) / 2).max(0);
+
+    let hwnd = CreateWindowExW(
+        WS_EX_TOPMOST,
+        class,
+        w!("restsend-vnc - connection request"),
+        style,
+        x,
+        y,
+        width,
+        height,
+        None,
+        None,
+        Some(hinst.into()),
+        None,
+    )
+    .unwrap_or_default();
+    if hwnd.0.is_null() {
+        tracing::warn!("could not create the connection confirmation window");
+        return;
+    }
+
+    CONFIRM_ID.store(pending.id, Ordering::Relaxed);
+    let hi = hinst.0 as isize;
+    let label: WINDOW_STYLE = WS_CHILD | WS_VISIBLE;
+    let body = format!(
+        "Accept this connection?\n\n{}\n{}\n\nNo screen data is sent until you accept.",
+        pending.peer, pending.info
+    );
+    let body_w = wide(&body);
+    ctrl(
+        hwnd,
+        w!("STATIC"),
+        PCWSTR(body_w.as_ptr()),
+        label,
+        f(18),
+        f(16),
+        f(424),
+        f(130),
+        0,
+        hi,
+    );
+    ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!(""),
+        label,
+        f(18),
+        f(150),
+        f(424),
+        f(20),
+        C_CC_COUNT,
+        hi,
+    );
+    ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Accept"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        f(230),
+        f(178),
+        f(100),
+        f(30),
+        C_CC_ACCEPT,
+        hi,
+    );
+    ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Reject"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+        f(340),
+        f(178),
+        f(100),
+        f(30),
+        C_CC_REJECT,
+        hi,
+    );
+    let reject = GetDlgItem(Some(hwnd), C_CC_REJECT).unwrap_or_default();
+    let _ = SetForegroundWindow(hwnd);
+    let _ = SetFocus(Some(reject));
+    let _ = SetTimer(Some(hwnd), 1, 200, None);
+
+    let flash = FLASHWINFO {
+        cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+        hwnd,
+        dwFlags: FLASHWINFO_FLAGS(FLASHW_ALL.0 | FLASHW_TIMERNOFG.0),
+        uCount: 3,
+        dwTimeout: 0,
+    };
+    let _ = FlashWindowEx(&flash);
+    let _ = MessageBeep(MB_ICONQUESTION);
+    update_confirm_countdown(hwnd, pending.deadline);
+}
+
+unsafe fn update_confirm_countdown(hwnd: HWND, deadline: Instant) {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let text = if remaining.is_zero() {
+        "Rejecting now...".to_string()
+    } else {
+        format!("Auto-reject in {} second(s)", remaining.as_secs().max(1))
+    };
+    let text = wide(&text);
+    let _ = SetDlgItemTextW(hwnd, C_CC_COUNT, PCWSTR(text.as_ptr()));
+}
+
+unsafe fn finish_confirm(hwnd: HWND, accept: bool) {
+    let id = CONFIRM_ID.load(Ordering::Relaxed);
+    if id != 0 {
+        crate::approval::resolve(id, accept);
+    }
+    let _ = DestroyWindow(hwnd);
+}
+
+unsafe extern "system" fn confirm_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            if clicked(wparam, C_CC_ACCEPT) {
+                finish_confirm(hwnd, true);
+            } else if clicked(wparam, C_CC_REJECT) {
+                finish_confirm(hwnd, false);
+            }
+        }
+        WM_TIMER => {
+            let id = CONFIRM_ID.load(Ordering::Relaxed);
+            if id == 0 || !crate::approval::is_pending(id) {
+                let _ = DestroyWindow(hwnd);
+            } else if let Some(pending) = crate::approval::front_pending() {
+                if pending.id == id {
+                    update_confirm_countdown(hwnd, pending.deadline);
+                    if Instant::now() >= pending.deadline {
+                        finish_confirm(hwnd, false);
+                    }
+                } else {
+                    finish_confirm(hwnd, false);
+                }
+            }
+        }
+        WM_CLOSE => finish_confirm(hwnd, false),
+        WM_DESTROY => {
+            let _ = KillTimer(Some(hwnd), 1);
+            CONFIRM_ID.store(0, Ordering::Relaxed);
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    LRESULT(0)
 }
 
 unsafe fn open_settings() {
@@ -274,7 +551,7 @@ unsafe fn open_settings() {
         left: 0,
         top: 0,
         right: f(480),
-        bottom: f(510),
+        bottom: f(452),
     };
     let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
 
@@ -282,7 +559,7 @@ unsafe fn open_settings() {
         WINDOW_EX_STYLE(0),
         class,
         w!("restsend-vnc settings"),
-        style,
+        style | WS_CLIPCHILDREN,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         wr.right - wr.left,
@@ -293,6 +570,7 @@ unsafe fn open_settings() {
         None,
     )
     .unwrap();
+    SETTINGS_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
 
     let s = crate::settings::load();
     let hi = hinst.0 as isize;
@@ -301,45 +579,110 @@ unsafe fn open_settings() {
     let check: WINDOW_STYLE =
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32);
 
-    let font = CreateFontW(
-        -f(15),
-        0,
-        0,
-        0,
-        FW_NORMAL.0 as i32,
-        0,
-        0,
-        0,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY,
-        (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-        w!("Segoe UI"),
+    let font = ensure_ui_font(scale);
+    SendMessageW(
+        hwnd,
+        WM_SETFONT,
+        Some(WPARAM(font.0 as usize)),
+        Some(LPARAM(1)),
     );
-    UI_FONT.store(font.0 as isize, AtomicOrdering::Relaxed);
-    SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
 
-    ctrl(hwnd, w!("STATIC"), w!("Port:"), label, f(18), f(20), f(80), f(20), 0, hi);
-    let port = ctrl(hwnd, w!("EDIT"), w!(""), edit, f(110), f(18), f(90), f(24), C_PORT, hi);
+    // --- tab strip ---------------------------------------------------------
+    let tab = ctrl(
+        hwnd,
+        WC_TABCONTROLW,
+        w!(""),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS,
+        f(12),
+        f(12),
+        f(456),
+        f(380),
+        C_TABS,
+        hi,
+    );
+    for (i, name) in ["General", "Security", "Files"].iter().enumerate() {
+        let mut text = wide(name);
+        let item = TCITEMW {
+            mask: TCIF_TEXT,
+            pszText: PWSTR(text.as_mut_ptr()),
+            cchTextMax: text.len() as i32,
+            ..Default::default()
+        };
+        let _ = SendMessageW(
+            tab,
+            TCM_INSERTITEMW,
+            Some(WPARAM(i)),
+            Some(LPARAM(&item as *const _ as isize)),
+        );
+    }
+    let _ = SendMessageW(tab, TCM_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+    SendMessageW(
+        tab,
+        WM_SETFONT,
+        Some(WPARAM(font.0 as usize)),
+        Some(LPARAM(1)),
+    );
+
+    // --- General page ------------------------------------------------------
+    let mut general: Vec<HWND> = Vec::new();
+    general.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Port:"),
+        label,
+        f(24),
+        f(58),
+        f(70),
+        f(20),
+        0,
+        hi,
+    ));
+    let port = ctrl(
+        hwnd,
+        w!("EDIT"),
+        w!(""),
+        edit,
+        f(100),
+        f(56),
+        f(90),
+        f(24),
+        C_PORT,
+        hi,
+    );
     let ptxt = wide(&s.port.to_string());
-    SetWindowTextW(port, PCWSTR(ptxt.as_ptr()));
+    let _ = SetWindowTextW(port, PCWSTR(ptxt.as_ptr()));
+    general.push(port);
 
-    ctrl(hwnd, w!("STATIC"), w!("Colour:"), label, f(220), f(20), f(70), f(20), 0, hi);
+    general.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Colour:"),
+        label,
+        f(212),
+        f(58),
+        f(60),
+        f(20),
+        0,
+        hi,
+    ));
     let combo = ctrl(
         hwnd,
         w!("COMBOBOX"),
         w!(""),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
-        f(292),
-        f(18),
-        f(120),
+        f(276),
+        f(56),
+        f(150),
         f(160),
         C_COLOR,
         hi,
     );
-    for t in ["High quality (24-bit)", "Balanced (16-bit)", "Fastest (8-bit)"]
-        .iter()
+    for t in [
+        "High quality (24-bit)",
+        "Balanced (16-bit)",
+        "Fastest (8-bit)",
+    ]
+    .iter()
     {
         let wv = wide(t);
         SendMessageW(
@@ -355,162 +698,189 @@ unsafe fn open_settings() {
         _ => 0,
     };
     let _ = SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(sel)), Some(LPARAM(0)));
+    general.push(combo);
 
-    ctrl(
+    general.push(ctrl(
         hwnd,
-        w!("BUTTON"),
-        w!("Only accept loopback connections"),
-        check,
-        f(18),
-        f(60),
-        f(420),
+        w!("STATIC"),
+        w!("Title:"),
+        label,
         f(24),
-        C_LOOPBACK,
+        f(98),
+        f(70),
+        f(20),
+        0,
+        hi,
+    ));
+    let title = ctrl(
+        hwnd,
+        w!("EDIT"),
+        w!(""),
+        edit,
+        f(100),
+        f(96),
+        f(320),
+        f(24),
+        C_TITLE,
         hi,
     );
-    let _ = CheckDlgButton(
-        hwnd,
-        C_LOOPBACK,
-        DLG_BUTTON_CHECK_STATE(if s.loopback_only { 1 } else { 0 }),
-    );
-    ctrl(
+    let ttxt = wide(&s.title);
+    let _ = SetWindowTextW(title, PCWSTR(ttxt.as_ptr()));
+    general.push(title);
+
+    general.push(ctrl(
         hwnd,
         w!("BUTTON"),
         w!("Keep the machine awake"),
         check,
-        f(18),
-        f(92),
-        f(420),
+        f(24),
+        f(134),
+        f(400),
         f(24),
         C_KEEP,
         hi,
+    ));
+    let _ = CheckDlgButton(
+        hwnd,
+        C_KEEP,
+        DLG_BUTTON_CHECK_STATE(if s.keep_awake { 1 } else { 0 }),
     );
-    let _ = CheckDlgButton(hwnd, C_KEEP, DLG_BUTTON_CHECK_STATE(if s.keep_awake { 1 } else { 0 }));
-    ctrl(
+
+    general.push(ctrl(
         hwnd,
         w!("BUTTON"),
         w!("Allow debug panel (Ctrl + 3 clicks)"),
         check,
-        f(18),
-        f(124),
-        f(420),
+        f(24),
+        f(166),
+        f(400),
         f(24),
         C_DEBUG,
         hi,
+    ));
+    let _ = CheckDlgButton(
+        hwnd,
+        C_DEBUG,
+        DLG_BUTTON_CHECK_STATE(if s.allow_debug { 1 } else { 0 }),
     );
-    let _ = CheckDlgButton(hwnd, C_DEBUG, DLG_BUTTON_CHECK_STATE(if s.allow_debug { 1 } else { 0 }));
 
-    ctrl(hwnd, w!("STATIC"), w!("Title:"), label, f(18), f(166), f(80), f(20), 0, hi);
-    let title = ctrl(hwnd, w!("EDIT"), w!(""), edit, f(110), f(164), f(320), f(24), C_TITLE, hi);
-    let ttxt = wide(&s.title);
-    SetWindowTextW(title, PCWSTR(ttxt.as_ptr()));
+    general.push(ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Start with Windows (current user)"),
+        check,
+        f(24),
+        f(198),
+        f(400),
+        f(24),
+        C_AUTOSTART,
+        hi,
+    ));
+    let _ = CheckDlgButton(
+        hwnd,
+        C_AUTOSTART,
+        DLG_BUTTON_CHECK_STATE(if s.autostart { 1 } else { 0 }),
+    );
 
-    ctrl(hwnd, w!("STATIC"), w!("Password:"), label, f(18), f(206), f(80), f(20), 0, hi);
+    // --- Security page -----------------------------------------------------
+    let mut security: Vec<HWND> = Vec::new();
+    security.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Password:"),
+        label,
+        f(24),
+        f(58),
+        f(70),
+        f(20),
+        0,
+        hi,
+    ));
     let pass = ctrl(
         hwnd,
         w!("EDIT"),
         w!(""),
-        edit, // plain text by default (no ES_PASSWORD masking)
-        f(110),
-        f(204),
+        edit, // stored in plain text by design
+        f(100),
+        f(56),
         f(320),
         f(24),
         C_PASS,
         hi,
     );
     let ptxt = wide(s.password.as_deref().unwrap_or(""));
-    SetWindowTextW(pass, PCWSTR(ptxt.as_ptr()));
+    let _ = SetWindowTextW(pass, PCWSTR(ptxt.as_ptr()));
+    security.push(pass);
 
-    ctrl(
+    security.push(ctrl(
         hwnd,
         w!("BUTTON"),
-        w!("Share files with connected clients"),
+        w!("Only accept loopback connections"),
         check,
-        f(18),
-        f(246),
-        f(420),
         f(24),
-        C_SHARE,
+        f(94),
+        f(400),
+        f(24),
+        C_LOOPBACK,
         hi,
-    );
+    ));
     let _ = CheckDlgButton(
         hwnd,
-        C_SHARE,
-        DLG_BUTTON_CHECK_STATE(if s.share_files { 1 } else { 0 }),
+        C_LOOPBACK,
+        DLG_BUTTON_CHECK_STATE(if s.loopback_only { 1 } else { 0 }),
     );
-    ctrl(
+
+    security.push(ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Ask before accepting incoming connections"),
+        check,
+        f(24),
+        f(126),
+        f(400),
+        f(24),
+        C_CONFIRM,
+        hi,
+    ));
+    let _ = CheckDlgButton(
+        hwnd,
+        C_CONFIRM,
+        DLG_BUTTON_CHECK_STATE(if s.confirm_connections { 1 } else { 0 }),
+    );
+
+    security.push(ctrl(
         hwnd,
         w!("STATIC"),
-        w!("Shared folder:"),
-        label,
-        f(18),
-        f(286),
-        f(90),
-        f(20),
+        w!("A local user must click Accept for every new connection. The request is rejected after 30 seconds, and no screen data is sent before it is accepted."),
+        WS_CHILD | WS_VISIBLE,
+        f(24),
+        f(152),
+        f(400),
+        f(56),
         0,
         hi,
-    );
-    let share_dir = ctrl(
-        hwnd,
-        w!("EDIT"),
-        w!(""),
-        edit,
-        f(110),
-        f(284),
-        f(270),
-        f(24),
-        C_SHARE_DIR,
-        hi,
-    );
-    let dtxt = wide(&s.share_dir.display().to_string());
-    let _ = SetWindowTextW(share_dir, PCWSTR(dtxt.as_ptr()));
-    ctrl(
-        hwnd,
-        w!("BUTTON"),
-        w!("Browse..."),
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        f(388),
-        f(283),
-        f(90),
-        f(26),
-        C_BROWSE,
-        hi,
-    );
+    ));
 
-    ctrl(
-        hwnd,
-        w!("BUTTON"),
-        w!("Start with Windows (current user)"),
-        check,
-        f(18),
-        f(326),
-        f(420),
-        f(24),
-        C_AUTOSTART,
-        hi,
-    );
-    let _ = CheckDlgButton(hwnd, C_AUTOSTART, DLG_BUTTON_CHECK_STATE(if s.autostart { 1 } else { 0 }));
-
-    ctrl(
+    security.push(ctrl(
         hwnd,
         w!("STATIC"),
         w!("Encryption:"),
         label,
-        f(18),
-        f(408),
-        f(90),
+        f(24),
+        f(222),
+        f(80),
         f(20),
         0,
         hi,
-    );
+    ));
     let tls = ctrl(
         hwnd,
         w!("COMBOBOX"),
         w!(""),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
         f(110),
-        f(404),
-        f(320),
+        f(220),
+        f(300),
         f(160),
         C_TLS,
         hi,
@@ -530,14 +900,15 @@ unsafe fn open_settings() {
         crate::tls::Mode::Off => 2,
     };
     let _ = SendMessageW(tls, CB_SETCURSEL, Some(WPARAM(tls_sel)), Some(LPARAM(0)));
+    security.push(tls);
 
     let elevate = ctrl(
         hwnd,
         w!("BUTTON"),
         w!("Install elevated autostart (admin)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        f(18),
-        f(360),
+        f(24),
+        f(264),
         f(300),
         f(30),
         C_ELEVATE,
@@ -545,6 +916,85 @@ unsafe fn open_settings() {
     );
     // UAC shield on the button (Common Controls v6).
     SendMessageW(elevate, 0x160C, Some(WPARAM(0)), Some(LPARAM(1)));
+    security.push(elevate);
+
+    // --- Files page --------------------------------------------------------
+    let mut files: Vec<HWND> = Vec::new();
+    files.push(ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Share files with connected clients"),
+        check,
+        f(24),
+        f(58),
+        f(400),
+        f(24),
+        C_SHARE,
+        hi,
+    ));
+    let _ = CheckDlgButton(
+        hwnd,
+        C_SHARE,
+        DLG_BUTTON_CHECK_STATE(if s.share_files { 1 } else { 0 }),
+    );
+
+    files.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Shared folder:"),
+        label,
+        f(24),
+        f(98),
+        f(90),
+        f(20),
+        0,
+        hi,
+    ));
+    let share_dir = ctrl(
+        hwnd,
+        w!("EDIT"),
+        w!(""),
+        edit,
+        f(120),
+        f(96),
+        f(260),
+        f(24),
+        C_SHARE_DIR,
+        hi,
+    );
+    let dtxt = wide(&s.share_dir.display().to_string());
+    let _ = SetWindowTextW(share_dir, PCWSTR(dtxt.as_ptr()));
+    files.push(share_dir);
+    files.push(ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Browse..."),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        f(388),
+        f(95),
+        f(80),
+        f(26),
+        C_BROWSE,
+        hi,
+    ));
+    files.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Clients can only browse this folder. The Tight file-transfer extension is used by TightVNC/UltraVNC-compatible viewers."),
+        WS_CHILD | WS_VISIBLE,
+        f(24),
+        f(136),
+        f(400),
+        f(56),
+        0,
+        hi,
+    ));
+
+    SETTINGS_PAGES.with(|pages| {
+        let to_isize = |v: Vec<HWND>| v.into_iter().map(|h| h.0 as isize).collect::<Vec<_>>();
+        *pages.borrow_mut() = vec![to_isize(general), to_isize(security), to_isize(files)];
+    });
+    show_settings_page(0);
 
     ctrl(
         hwnd,
@@ -552,7 +1002,7 @@ unsafe fn open_settings() {
         w!("Save"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
         f(250),
-        f(456),
+        f(408),
         f(90),
         f(30),
         1,
@@ -564,7 +1014,7 @@ unsafe fn open_settings() {
         w!("Cancel"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         f(350),
-        f(456),
+        f(408),
         f(90),
         f(30),
         2,
@@ -573,6 +1023,9 @@ unsafe fn open_settings() {
 
     let mut msg = MSG::default();
     while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        if crate::settings::EXIT.load(Ordering::Relaxed) {
+            break;
+        }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
@@ -659,16 +1112,25 @@ unsafe extern "system" fn settings_proc(
                     port,
                     color_level: color,
                     loopback_only: IsDlgButtonChecked(hwnd, C_LOOPBACK) == 1,
+                    confirm_connections: IsDlgButtonChecked(hwnd, C_CONFIRM) == 1,
                     keep_awake: IsDlgButtonChecked(hwnd, C_KEEP) == 1,
                     allow_debug: IsDlgButtonChecked(hwnd, C_DEBUG) == 1,
                     autostart: IsDlgButtonChecked(hwnd, C_AUTOSTART) == 1,
                     password: {
                         let p = read_text(hwnd, C_PASS);
-                        if p.is_empty() { None } else { Some(p) }
+                        if p.is_empty() {
+                            None
+                        } else {
+                            Some(p)
+                        }
                     },
                     title: {
                         let t = read_text(hwnd, C_TITLE);
-                        if t.trim().is_empty() { "restsend-vnc".to_string() } else { t }
+                        if t.trim().is_empty() {
+                            "restsend-vnc".to_string()
+                        } else {
+                            t
+                        }
                     },
                     // Site URL is not edited here; keep the configured/default one.
                     url: crate::settings::url(),
@@ -717,7 +1179,20 @@ unsafe extern "system" fn settings_proc(
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
         }
-        WM_DESTROY => PostQuitMessage(0),
+        WM_NOTIFY => {
+            let hdr = lparam.0 as *const NMHDR;
+            if !hdr.is_null() && (*hdr).code == TCN_SELCHANGE {
+                let tab = GetDlgItem(Some(hwnd), C_TABS).unwrap_or_default();
+                let index =
+                    SendMessageW(tab, TCM_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0 as usize;
+                show_settings_page(index);
+            }
+        }
+        WM_DESTROY => {
+            SETTINGS_PAGES.with(|pages| pages.borrow_mut().clear());
+            SETTINGS_HWND.store(0, Ordering::Relaxed);
+            PostQuitMessage(0);
+        }
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)

@@ -105,16 +105,20 @@ pub fn enable_dpi_awareness() {
 fn send_vk(vk: u16, down: bool) {
     use windows::Win32::Foundation::LPARAM;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_KEYBOARD, INPUT_0, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
         KEYEVENTF_KEYUP,
     };
     // Navigation/right-hand keys must carry the extended-key flag or some
     // apps read them as the numpad equivalents.
     const EXTENDED: &[u16] = &[
-        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2C, 0x2D, 0x2E, 0x5B, 0x5C, 0x5D,
-        0x6F, 0x90, 0xA3, 0xA5,
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2C, 0x2D, 0x2E, 0x5B, 0x5C, 0x5D, 0x6F,
+        0x90, 0xA3, 0xA5,
     ];
-    let mut flags = if down { Default::default() } else { KEYEVENTF_KEYUP };
+    let mut flags = if down {
+        Default::default()
+    } else {
+        KEYEVENTF_KEYUP
+    };
     if EXTENDED.contains(&vk) {
         flags |= KEYEVENTF_EXTENDEDKEY;
     }
@@ -138,20 +142,24 @@ fn send_vk(vk: u16, down: bool) {
 
 fn send_unicode(ch: char, down: bool) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_KEYBOARD, INPUT_0, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     };
     let mut units = [0u16; 2];
     let len = ch.len_utf16();
     ch.encode_utf16(&mut units);
-    for i in 0..len {
+    for unit in units.iter().take(len) {
         let flags = KEYEVENTF_UNICODE
-            | if down { Default::default() } else { KEYEVENTF_KEYUP };
+            | if down {
+                Default::default()
+            } else {
+                KEYEVENTF_KEYUP
+            };
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: Default::default(),
-                    wScan: units[i],
+                    wScan: *unit,
                     dwFlags: flags,
                     time: 0,
                     dwExtraInfo: usize::default(),
@@ -239,8 +247,7 @@ fn ascii_vk(ch: char) -> Option<u16> {
 
 fn send_mouse_move(norm_x: i32, norm_y: i32) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_MOUSE, INPUT_0, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE,
-        MOUSEINPUT,
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEINPUT,
     };
     let input = INPUT {
         r#type: INPUT_MOUSE,
@@ -262,7 +269,7 @@ fn send_mouse_move(norm_x: i32, norm_y: i32) {
 
 fn send_mouse_flag(flag: MOUSE_EVENT_FLAGS) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_MOUSE, INPUT_0, MOUSEINPUT,
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
     };
     let input = INPUT {
         r#type: INPUT_MOUSE,
@@ -284,7 +291,7 @@ fn send_mouse_flag(flag: MOUSE_EVENT_FLAGS) {
 
 fn send_wheel(flag: windows::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS, delta: i32) {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_MOUSE, INPUT_0, MOUSEINPUT,
+        SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEINPUT,
     };
     let input = INPUT {
         r#type: INPUT_MOUSE,

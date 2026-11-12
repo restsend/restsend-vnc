@@ -249,11 +249,7 @@ pub fn encrypt_ecb_block(key: &[u8; 16], block: &mut [u8; 16]) {
 /// After this message both directions switch to AES-128-CBC for the encrypted
 /// control channel (`EncryptOneMessage`).
 #[allow(dead_code)]
-pub fn encryption_setup_message(
-    dh_key: &[u8; 16],
-    enc_key: &[u8; 16],
-    iv: &[u8; 16],
-) -> Vec<u8> {
+pub fn encryption_setup_message(dh_key: &[u8; 16], enc_key: &[u8; 16], iv: &[u8; 16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(52);
     out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
     out.extend_from_slice(&[0u8; 8]);

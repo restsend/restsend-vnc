@@ -42,7 +42,8 @@ fn encode_tile(
     th: usize,
     stride: usize,
     enc: &PixelEncoder,
-) {    let base = ty * stride + tx * 4;
+) {
+    let base = ty * stride + tx * 4;
     let first: [u8; 4] = frame.bgra[base..base + 4].try_into().unwrap();
 
     // Uniformity check: every pixel must equal the first one.
@@ -105,7 +106,11 @@ mod tests {
         for y in 0..32usize {
             for x in 0..32usize {
                 let off = (y * frame.stride()) + x * 4;
-                let color = if x < 16 { [0u8; 4] } else { [x as u8, y as u8, 7, 255] };
+                let color = if x < 16 {
+                    [0u8; 4]
+                } else {
+                    [x as u8, y as u8, 7, 255]
+                };
                 frame.bgra[off..off + 4].copy_from_slice(&color);
             }
         }

@@ -64,6 +64,7 @@ fn test_pattern_session_reaches_framebuffer_update() {
         .args([
             "--test-pattern",
             "--no-auth",
+            "--no-confirm",
             "--host",
             "127.0.0.1",
             "--port",
@@ -144,7 +145,8 @@ fn test_pattern_session_reaches_framebuffer_update() {
             0 => {
                 let _pad = read_u8(&mut s);
                 let nrects = read_u16(&mut s) as usize;
-                for _ in 0..nrects {
+                assert!(nrects > 0, "framebuffer update carried no rects");
+                {
                     let x = read_u16(&mut s);
                     let y = read_u16(&mut s);
                     let w = read_u16(&mut s);
@@ -157,7 +159,6 @@ fn test_pattern_session_reaches_framebuffer_update() {
                     // this test only needs the first header. Close instead.
                     let _ = (x, y, w, h);
                     saw_update = true;
-                    break;
                 }
                 if saw_update {
                     break;

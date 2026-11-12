@@ -47,10 +47,10 @@ impl Frame {
         let nhu = nh as usize;
         let fill_row = |dy: usize, dst: &mut [u8]| {
             let y0 = dy * sh / nhu;
-            let y1 = (((dy + 1) * sh + nhu - 1) / nhu).clamp(y0 + 1, sh);
+            let y1 = ((dy + 1) * sh).div_ceil(nhu).clamp(y0 + 1, sh);
             for dx in 0..nwu {
                 let x0 = dx * sw / nwu;
-                let x1 = (((dx + 1) * sw + nwu - 1) / nwu).clamp(x0 + 1, sw);
+                let x1 = ((dx + 1) * sw).div_ceil(nwu).clamp(x0 + 1, sw);
                 let (mut b, mut g, mut r) = (0u32, 0u32, 0u32);
                 let mut n = 0u32;
                 for y in y0..y1 {
@@ -110,6 +110,7 @@ impl Frame {
         out
     }
 
+    #[allow(dead_code)]
     pub fn copy_region(&mut self, src: &Frame, x: u32, y: u32, w: u32, h: u32) {
         if self.dims() != src.dims() {
             return;
@@ -165,6 +166,7 @@ pub struct ScreenState {
     cursor_generation: AtomicU64,
     /// Physical screen rect of the captured display, used to map
     /// `GetCursorPos` coordinates into framebuffer coordinates.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     cursor_map: Mutex<Option<(i32, i32, u32, u32)>>,
 }
 
@@ -186,14 +188,14 @@ fn quantize(frame: &mut Frame, level: u8) {
         _ => return,
     };
     let pass = |row: &mut [u8]| {
-        for px in row.chunks_exact_mut(4) {
+        for px in row.as_chunks_mut::<4>().0 {
             let v = u32::from_ne_bytes([px[0], px[1], px[2], px[3]]) & mask;
             px.copy_from_slice(&v.to_ne_bytes());
         }
     };
     if frame.bgra.len() >= 1 << 20 {
         let stride = frame.stride();
-        frame.bgra.par_chunks_mut(stride).for_each(|row| pass(row));
+        frame.bgra.par_chunks_mut(stride).for_each(pass);
     } else {
         pass(&mut frame.bgra);
     }
@@ -228,11 +230,13 @@ fn now_millis() -> u64 {
 }
 
 impl ScreenState {
+    #[allow(dead_code)]
     pub fn new(max_fps: u32) -> Self {
         Self::with_color_level(max_fps, 24)
     }
 
     /// `color_level` is 8 (3-3-2), 16 (5-6-5) or 24 (full colour).
+    #[allow(dead_code)]
     pub fn with_color_level(max_fps: u32, color_level: u8) -> Self {
         Self::with_options(max_fps, color_level, 1.0)
     }
@@ -272,6 +276,7 @@ impl ScreenState {
         self.cursor_generation.load(Ordering::Relaxed)
     }
 
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn set_cursor_shape(&self, shape: Option<Arc<CursorShape>>) {
         if self.cursor.lock().unwrap().set_shape(shape) {
             // The pusher also waits on this counter, so a shape change wakes
@@ -286,6 +291,7 @@ impl ScreenState {
         }
     }
 
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn set_cursor_visible(&self, visible: bool) {
         if self.cursor.lock().unwrap().set_visible(visible) {
             self.cursor_generation.fetch_add(1, Ordering::Relaxed);
@@ -293,6 +299,7 @@ impl ScreenState {
     }
 
     /// Physical rect of the captured monitor (virtual-screen coordinates).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn set_cursor_map(&self, x: i32, y: i32, w: u32, h: u32) {
         if w > 0 && h > 0 {
             *self.cursor_map.lock().unwrap() = Some((x, y, w, h));
@@ -302,6 +309,7 @@ impl ScreenState {
     /// Maps a physical screen point to framebuffer coordinates (accounting
     /// for `--scale` and multi-monitor origins). Returns None until the first
     /// frame and monitor rect are known.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn map_screen_point(&self, sx: i32, sy: i32) -> Option<(u16, u16)> {
         let (ox, oy, mw, mh) = (*self.cursor_map.lock().unwrap())?;
         let (fw, fh) = {
@@ -479,6 +487,7 @@ impl ScreenState {
     }
 
     /// Number of real capture frames published so far.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn capture_generation(&self) -> u64 {
         self.capture_generation.load(Ordering::Relaxed)
     }
@@ -522,7 +531,7 @@ mod tests {
     #[test]
     fn subframe_matches_copy_region() {
         let mut src = Frame::new(8, 6);
-        for (i, px) in src.bgra.chunks_exact_mut(4).enumerate() {
+        for (i, px) in src.bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px.copy_from_slice(&[(i % 251) as u8, (i / 3 % 241) as u8, 7, 255]);
         }
         let sub = src.subframe(2, 1, 4, 3);
@@ -543,7 +552,7 @@ mod tests {
     fn quantize_parallel_path_is_idempotent() {
         // 512x512x4 == 1 MiB, which selects the rayon path.
         let mut frame = Frame::new(512, 512);
-        for (i, px) in frame.bgra.chunks_exact_mut(4).enumerate() {
+        for (i, px) in frame.bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px.copy_from_slice(&[
                 (i % 256) as u8,
                 (i * 7 % 256) as u8,
@@ -553,7 +562,7 @@ mod tests {
         }
         quantize(&mut frame, 16);
         let mask: u32 = 0xFFF8_FCF8;
-        for px in frame.bgra.chunks_exact(4) {
+        for px in frame.bgra.as_chunks::<4>().0 {
             let v = u32::from_ne_bytes([px[0], px[1], px[2], px[3]]);
             assert_eq!(v & !mask, 0);
         }
@@ -572,10 +581,10 @@ mod tests {
         let ostride = out.stride();
         for dy in 0..nh as usize {
             let y0 = dy * sh / nh as usize;
-            let y1 = (((dy + 1) * sh + nh as usize - 1) / nh as usize).clamp(y0 + 1, sh);
+            let y1 = ((dy + 1) * sh).div_ceil(nh as usize).clamp(y0 + 1, sh);
             for dx in 0..nw as usize {
                 let x0 = dx * sw / nw as usize;
-                let x1 = (((dx + 1) * sw + nw as usize - 1) / nw as usize).clamp(x0 + 1, sw);
+                let x1 = ((dx + 1) * sw).div_ceil(nw as usize).clamp(x0 + 1, sw);
                 let (mut b, mut g, mut r) = (0u32, 0u32, 0u32);
                 let mut n = 0u32;
                 for y in y0..y1 {

@@ -31,6 +31,7 @@ pub struct CursorShape {
 }
 
 impl CursorShape {
+    #[allow(dead_code)]
     pub fn new(width: u16, height: u16, hot_x: u16, hot_y: u16, bgra: Vec<u8>) -> Self {
         debug_assert_eq!(bgra.len(), width as usize * height as usize * 4);
         CursorShape {
@@ -92,10 +93,12 @@ pub struct CursorSnapshot {
 #[derive(Default)]
 pub struct CursorStore {
     snapshot: CursorSnapshot,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     next_shape_serial: u64,
 }
 
 impl CursorStore {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn set_shape(&mut self, shape: Option<Arc<CursorShape>>) -> bool {
         let changed = match (&self.snapshot.shape, &shape) {
             (Some(a), Some(b)) => !Arc::ptr_eq(a, b) && **a != **b,
@@ -122,6 +125,7 @@ impl CursorStore {
         true
     }
 
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fn set_visible(&mut self, visible: bool) -> bool {
         if self.snapshot.visible == visible {
             return false;
@@ -231,10 +235,10 @@ pub fn rich_cursor_message(shape: &CursorShape, enc: &PixelEncoder) -> Vec<u8> {
         shape.height,
         pseudo::RICH_CURSOR,
     ));
-    for px in shape.bgra.chunks_exact(4) {
+    for px in shape.bgra.as_chunks::<4>().0 {
         enc.push_pixel(&mut out, [px[0], px[1], px[2], px[3]]);
     }
-    let mask_stride = (shape.width as usize + 7) / 8;
+    let mask_stride = (shape.width as usize).div_ceil(8);
     let mut mask = vec![0u8; mask_stride * shape.height as usize];
     for y in 0..shape.height as usize {
         for x in 0..shape.width as usize {
@@ -416,7 +420,7 @@ unsafe fn extract_shape(
             return None;
         }
 
-        let has_alpha = got != 0 && pixels.chunks_exact(4).any(|p| p[3] != 0);
+        let has_alpha = got != 0 && pixels.as_chunks::<4>().0.iter().any(|p| p[3] != 0);
         if !has_alpha {
             // Legacy 1-bit cursor: the AND mask says which pixels are opaque.
             for i in 0..(w as usize * h as usize) {
@@ -482,7 +486,7 @@ mod tests {
     #[test]
     fn overlay_blends_and_preserves_base_elsewhere() {
         let mut base = Frame::new(4, 4);
-        for px in base.bgra.chunks_exact_mut(4) {
+        for px in base.bgra.as_chunks_mut::<4>().0 {
             px.copy_from_slice(&[10, 20, 30, 255]);
         }
         let snap = CursorSnapshot {
@@ -510,7 +514,7 @@ mod tests {
     #[test]
     fn overlay_rect_is_subframe() {
         let mut base = Frame::new(8, 8);
-        for (i, px) in base.bgra.chunks_exact_mut(4).enumerate() {
+        for (i, px) in base.bgra.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px.copy_from_slice(&[i as u8, 0, 0, 255]);
         }
         let out = overlay_frame(

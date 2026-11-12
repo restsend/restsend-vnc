@@ -92,6 +92,7 @@ fn vencrypt_tls_session_reaches_framebuffer_update() {
         .args([
             "--test-pattern",
             "--no-auth",
+            "--no-confirm",
             "--tls",
             "required",
             "--tls-cert",

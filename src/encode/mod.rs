@@ -83,7 +83,10 @@ mod tests {
     fn encoding_preference() {
         assert_eq!(Encoding::pick(&[5, 0]), Encoding::Hextile);
         assert_eq!(Encoding::pick(&[16, 5]), Encoding::Zrle);
-        assert_eq!(Encoding::pick(&[1011, 1002, 6, 16, -239, -223]), Encoding::Zrle);
+        assert_eq!(
+            Encoding::pick(&[1011, 1002, 6, 16, -239, -223]),
+            Encoding::Zrle
+        );
         assert_eq!(Encoding::pick(&[-223, 5]), Encoding::Hextile);
         assert_eq!(Encoding::pick(&[-239]), Encoding::Raw);
         assert_eq!(Encoding::pick(&[]), Encoding::Raw);
