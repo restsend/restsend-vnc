@@ -217,8 +217,6 @@ fn main() {
     spawn_sys_sampler(Arc::clone(&state));
     // Encoder reads this when it creates its per-session zlib stream.
     std::env::set_var("RESTSEND_VNC_ZRLE_LEVEL", cfg.zrle_level.to_string());
-    // windows-capture reads this to coalesce frames before the GPU->CPU copy.
-    std::env::set_var("RESTSEND_VNC_CAPTURE_FPS", cfg.fps.max(1).to_string());
     let kind = if cfg.test_pattern {
         screen::ScreenKind::Dummy
     } else {

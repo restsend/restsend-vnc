@@ -111,6 +111,9 @@ cargo build --release --target x86_64-pc-windows-gnu --no-default-features
 
 Artifact: `target/x86_64-pc-windows-gnu/release/restsend-vnc.exe`
 
+Desktop capture uses `windows-capture 2.x` directly (no `scap` wrapper and no
+vendored copy).
+
 The release profile uses fat LTO and one codegen unit; the win64 build is
 about 3.8 MB (down from 4.9 MB with thin LTO).
 
