@@ -67,6 +67,12 @@ pub fn serve(
             let _ = stream.shutdown(Shutdown::Both);
             continue;
         }
+        if !crate::settings::allows(peer.ip()) {
+            tracing::warn!("rejecting {peer}: not in allow_cidrs");
+            crate::audit::log("acl_reject", &peer, "not in allow_cidrs", None);
+            let _ = stream.shutdown(Shutdown::Both);
+            continue;
+        }
         let peer: SocketAddr = peer;
         let Ok(stream) = configure_stream(stream) else {
             continue;

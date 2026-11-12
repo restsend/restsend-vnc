@@ -1,13 +1,15 @@
 //! VeNCrypt (RFB security type 19) version/sub-type negotiation and the
 //! upgrade to a rustls TLS stream.
 //!
-//! Only the anonymous TLS sub-types are implemented:
-//! * 257 TLSNone — TLS, no authentication
-//! * 258 TLSVnc  — TLS + legacy VNC (DES challenge/response) authentication
+//! Only the X.509 sub-types are implemented:
+//! * 260 X509None — TLS with a server certificate, no authentication
+//! * 261 X509Vnc  — TLS with a server certificate + VNC DES authentication
 //!
-//! 256 (Plain) and the X509 client-certificate variants are deliberately not
-//! offered. After the TLS handshake all further RFB traffic (including the
-//! inner authentication and ClientInit) is encrypted.
+//! The anonymous TLS sub-types (257 TLSNone / 258 TLSVnc) are deliberately
+//! not offered: they use anonymous cipher suites, which rustls does not
+//! implement, and TigerVNC/RealVNC both support the X.509 variants. After the
+//! TLS handshake all further RFB traffic (including the inner authentication
+//! and ClientInit) is encrypted.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -19,12 +21,12 @@ pub const SEC_VENCRYPT: u8 = 19;
 pub const VERSION_MAJOR: u8 = 0;
 pub const VERSION_MINOR: u8 = 2;
 
-pub const SUBTYPE_TLSNONE: u32 = 257;
-pub const SUBTYPE_TLSVNC: u32 = 258;
+pub const SUBTYPE_X509NONE: u32 = 260;
+pub const SUBTYPE_X509VNC: u32 = 261;
 
 /// Runs the VeNCrypt version and sub-type handshake.
 ///
-/// `offer_vnc_auth` selects TLSVnc (password configured) instead of TLSNone.
+/// `offer_vnc_auth` selects X509Vnc (password configured) instead of X509None.
 pub fn negotiate<S: Read + Write>(stream: &mut S, offer_vnc_auth: bool) -> io::Result<u32> {
     stream.write_all(&[VERSION_MAJOR, VERSION_MINOR])?;
     stream.flush()?;
@@ -48,9 +50,9 @@ pub fn negotiate<S: Read + Write>(stream: &mut S, offer_vnc_auth: bool) -> io::R
     stream.write_all(&[0])?;
 
     let subtypes: &[u32] = if offer_vnc_auth {
-        &[SUBTYPE_TLSVNC]
+        &[SUBTYPE_X509VNC]
     } else {
-        &[SUBTYPE_TLSNONE]
+        &[SUBTYPE_X509NONE]
     };
     stream.write_all(&[subtypes.len() as u8])?;
     for subtype in subtypes {
@@ -67,6 +69,12 @@ pub fn negotiate<S: Read + Write>(stream: &mut S, offer_vnc_auth: bool) -> io::R
         )));
     }
     tracing::debug!("VeNCrypt: version 0.2, sub-type {choice}");
+    // The TLS/X509 sub-types require an explicit success ACK before the TLS
+    // handshake starts. TigerVNC (and other GnuTLS clients) wait for this
+    // byte; omitting it stalls both sides until the connection times out.
+    // 0 = failure, 1 = success.
+    stream.write_all(&[1])?;
+    stream.flush()?;
     Ok(choice)
 }
 

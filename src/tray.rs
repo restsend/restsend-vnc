@@ -59,6 +59,7 @@ const C_SHARE_DIR: i32 = 1012;
 const C_BROWSE: i32 = 1013;
 const C_TLS: i32 = 1014;
 const C_CONFIRM: i32 = 1015;
+const C_ALLOW: i32 = 1016;
 const C_TABS: i32 = 1020;
 
 const C_CC_COUNT: i32 = 1031;
@@ -836,7 +837,7 @@ unsafe fn open_settings() {
         w!("Ask before accepting incoming connections"),
         check,
         f(24),
-        f(126),
+        f(124),
         f(400),
         f(24),
         C_CONFIRM,
@@ -851,12 +852,12 @@ unsafe fn open_settings() {
     security.push(ctrl(
         hwnd,
         w!("STATIC"),
-        w!("A local user must click Accept for every new connection. The request is rejected after 30 seconds, and no screen data is sent before it is accepted."),
+        w!("Each new connection must be accepted locally.\nNo screen data is sent before you accept.\nRequests are rejected after 30 seconds."),
         WS_CHILD | WS_VISIBLE,
         f(24),
-        f(152),
+        f(150),
         f(400),
-        f(56),
+        f(66),
         0,
         hi,
     ));
@@ -867,7 +868,7 @@ unsafe fn open_settings() {
         w!("Encryption:"),
         label,
         f(24),
-        f(222),
+        f(220),
         f(80),
         f(20),
         0,
@@ -879,7 +880,7 @@ unsafe fn open_settings() {
         w!(""),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
         f(110),
-        f(220),
+        f(218),
         f(300),
         f(160),
         C_TLS,
@@ -902,13 +903,53 @@ unsafe fn open_settings() {
     let _ = SendMessageW(tls, CB_SETCURSEL, Some(WPARAM(tls_sel)), Some(LPARAM(0)));
     security.push(tls);
 
+    security.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Allowed networks (CIDR, empty = all):"),
+        label,
+        f(24),
+        f(250),
+        f(400),
+        f(20),
+        0,
+        hi,
+    ));
+    let allow = ctrl(
+        hwnd,
+        w!("EDIT"),
+        w!(""),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        f(24),
+        f(274),
+        f(400),
+        f(24),
+        C_ALLOW,
+        hi,
+    );
+    let atxt = wide(&s.allow_cidrs);
+    let _ = SetWindowTextW(allow, PCWSTR(atxt.as_ptr()));
+    security.push(allow);
+    security.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Loopback is not implicit: add 127.0.0.1/32.\nExample: 192.168.1.0/24, 10.0.0.0/8"),
+        WS_CHILD | WS_VISIBLE,
+        f(24),
+        f(302),
+        f(400),
+        f(44),
+        0,
+        hi,
+    ));
+
     let elevate = ctrl(
         hwnd,
         w!("BUTTON"),
         w!("Install elevated autostart (admin)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         f(24),
-        f(264),
+        f(354),
         f(300),
         f(30),
         C_ELEVATE,
@@ -980,12 +1021,12 @@ unsafe fn open_settings() {
     files.push(ctrl(
         hwnd,
         w!("STATIC"),
-        w!("Clients can only browse this folder. The Tight file-transfer extension is used by TightVNC/UltraVNC-compatible viewers."),
+        w!("Clients can only browse this folder.\nThe Tight file-transfer extension is used by\nTightVNC/UltraVNC-compatible viewers."),
         WS_CHILD | WS_VISIBLE,
         f(24),
         f(136),
         f(400),
-        f(56),
+        f(66),
         0,
         hi,
     ));
@@ -1108,11 +1149,23 @@ unsafe extern "system" fn settings_proc(
                     2 => crate::tls::Mode::Off,
                     _ => crate::tls::Mode::Auto,
                 };
+                let allow_cidrs = read_text(hwnd, C_ALLOW);
+                if let Err(e) = crate::acl::check(&allow_cidrs) {
+                    let msg = wide(&format!("Allowed networks are invalid:\n\n{e}"));
+                    MessageBoxW(
+                        Some(hwnd),
+                        PCWSTR(msg.as_ptr()),
+                        w!("restsend-vnc"),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                    return LRESULT(0);
+                }
                 let s = crate::settings::Settings {
                     port,
                     color_level: color,
                     loopback_only: IsDlgButtonChecked(hwnd, C_LOOPBACK) == 1,
                     confirm_connections: IsDlgButtonChecked(hwnd, C_CONFIRM) == 1,
+                    allow_cidrs,
                     keep_awake: IsDlgButtonChecked(hwnd, C_KEEP) == 1,
                     allow_debug: IsDlgButtonChecked(hwnd, C_DEBUG) == 1,
                     autostart: IsDlgButtonChecked(hwnd, C_AUTOSTART) == 1,

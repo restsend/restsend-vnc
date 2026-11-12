@@ -6,6 +6,7 @@
 //!
 //! See README.md for usage notes.
 
+mod acl;
 mod approval;
 mod audit;
 mod autostart;
@@ -132,6 +133,9 @@ fn main() {
     if let Some(confirm) = cfg.confirm {
         effective.confirm_connections = confirm;
     }
+    if let Some(cidrs) = &cfg.allow_cidrs {
+        effective.allow_cidrs = cidrs.clone();
+    }
     if cfg.debug {
         effective.allow_debug = true;
     }
@@ -149,11 +153,12 @@ fn main() {
     }
     settings::apply_live(&effective);
     tracing::info!(
-        "settings: port={} color={} loopback_only={} confirm_connections={} keep_awake={} allow_debug={} tls={} url={}",
+        "settings: port={} color={} loopback_only={} confirm_connections={} allow_cidrs={:?} keep_awake={} allow_debug={} tls={} url={}",
         effective.port,
         effective.color_level,
         effective.loopback_only,
         effective.confirm_connections,
+        effective.allow_cidrs,
         effective.keep_awake,
         effective.allow_debug,
         effective.tls,

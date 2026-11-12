@@ -349,15 +349,15 @@ pub fn perform<S: Read + Write>(
             let mut tls_stream = vencrypt::start_tls(stream, config)
                 .map_err(|e| stage_err("TLS handshake", e.into()))?;
             match subtype {
-                vencrypt::SUBTYPE_TLSVNC => {
+                vencrypt::SUBTYPE_X509VNC => {
                     let pw = password.ok_or_else(|| {
                         HandshakeError::Protocol(
-                            "client chose TLSVnc with no password configured".into(),
+                            "client chose X509Vnc with no password configured".into(),
                         )
                     })?;
                     vnc_auth_exchange(&mut tls_stream, pw, true)?;
                 }
-                vencrypt::SUBTYPE_TLSNONE => {}
+                vencrypt::SUBTYPE_X509NONE => {}
                 other => {
                     return Err(HandshakeError::Protocol(format!(
                         "unsupported VeNCrypt sub-type {other}"
@@ -379,7 +379,7 @@ pub fn perform<S: Read + Write>(
                 minor,
                 security_type: vencrypt::SEC_VENCRYPT,
                 tight: false,
-                auth: if subtype == vencrypt::SUBTYPE_TLSVNC {
+                auth: if subtype == vencrypt::SUBTYPE_X509VNC {
                     AuthMethod::VeNCryptTlsVnc
                 } else {
                     AuthMethod::VeNCryptTlsNone
@@ -706,10 +706,13 @@ mod tests {
             client.read_exact(&mut subtypes).unwrap();
             assert!(subtypes
                 .chunks(4)
-                .any(|c| u32::from_be_bytes(c.try_into().unwrap()) == vencrypt::SUBTYPE_TLSVNC));
+                .any(|c| u32::from_be_bytes(c.try_into().unwrap()) == vencrypt::SUBTYPE_X509VNC));
             client
-                .write_all(&vencrypt::SUBTYPE_TLSVNC.to_be_bytes())
+                .write_all(&vencrypt::SUBTYPE_X509VNC.to_be_bytes())
                 .unwrap();
+            let mut ack = [0u8; 1];
+            client.read_exact(&mut ack).unwrap();
+            assert_eq!(ack, [1], "VeNCrypt TLS ACK");
 
             // TLS handshake, then VNC auth inside TLS.
             let conn =

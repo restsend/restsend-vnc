@@ -98,6 +98,8 @@ fn spawn(port: u16, extra: &[&str], envs: &[(&str, &str)]) -> KillOnDrop {
     cmd.args([
         "--test-pattern",
         "--no-auth",
+        "--allow-cidrs",
+        "127.0.0.1/32",
         "--host",
         "127.0.0.1",
         "--port",

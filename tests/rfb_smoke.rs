@@ -65,6 +65,8 @@ fn test_pattern_session_reaches_framebuffer_update() {
             "--test-pattern",
             "--no-auth",
             "--no-confirm",
+            "--allow-cidrs",
+            "127.0.0.1/32",
             "--host",
             "127.0.0.1",
             "--port",

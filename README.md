@@ -9,13 +9,14 @@ Works with standard VNC viewers and with macOS built-in Screen Sharing.
 - Mouse/keyboard injection (Unicode, modifiers, wheel, extended keys)
 - Encodings: Raw / Hextile / ZRLE (zlib-rs + SSSE3 + packed palette)
 - Standard clipboard sync, both directions (text)
-- TLS via VeNCrypt (RFB security type 19), self-signed certificate generated on first use; works with TigerVNC and other VeNCrypt viewers
+- TLS via VeNCrypt (RFB security type 19, X509None/X509Vnc subtypes), self-signed certificate generated on first use; works with TigerVNC and other VeNCrypt viewers
 - File transfer via Tight extensions (upload/download/resume/mkdir), off by default and sandboxed to the configured shared folder (defaults to your user directory)
 - Tray icon + native tabbed settings window (General / Security / Files): port, colour level, password, title, loopback-only, keep-awake, debug panel, shared folder, encryption
 - Optional manual connection approval: every authenticated connection can require a local Accept/Reject click; no screen data is sent before approval, and unanswered requests are rejected after 30 seconds
+- CIDR allow-list for incoming peers (Security tab or `--allow-cidrs`); empty means allow all, and a malformed list fails closed
 - macOS Screen Sharing: RFB 003.889 + Apple DH (type 30) auth, video/input, lock-screen notice
 - Debug overlay (fps, throughput, encode time, CPU, memory, versions) — toggle with `Ctrl + 3 left clicks`
-- Session audit log (client version, connect time, disconnect reason, duration, confirmation pending/accept/reject/timeout)
+- Session audit log (client version, connect time, disconnect reason, duration, confirmation pending/accept/reject/timeout, ACL rejects)
 - Single instance; renders a notice while the Windows session is locked
 
 ## Download
@@ -60,7 +61,8 @@ Default listen address is `0.0.0.0`. Enable **Only accept loopback connections**
 - Command-line flags apply to the current run only, are never written to the config file, and override it
 - File transfer is **off by default**. Enable **Share files** in Settings and choose a shared folder (defaults to your user directory); new connections pick the change up immediately. `--share-dir <DIR>` enables it for the current run only
 - Connection confirmation is **off by default**. Enable **Ask before accepting incoming connections** on the Security tab (or pass `--confirm`) to require a local Accept click for each new connection. The prompt appears after authentication and before `ServerInit`; rejected, timed-out (30 s) or unattended requests are closed without sending any screen data. At most 4 requests are queued; further connections are refused. Use `--no-confirm` to override the persisted setting for one run
-- Common flags: `--port`, `--password`, `--host`, `--color-level 8|16|24`, `--fps`, `--scale`, `--share-dir`, `--debug`, `--tls`, `--confirm`, `--no-confirm`
+- The **Allowed networks (CIDR)** field on the Security tab restricts incoming peers. Entries are comma or space separated (`192.168.1.0/24, 10.0.0.0/8`); a bare address means a single host. Leave it empty to allow all. Loopback is **not** implicit, so add `127.0.0.1/32` if local viewers must connect. Invalid entries are rejected when saving; a hand-edited invalid list fails closed. The rule applies to new connections immediately (`--allow-cidrs LIST` overrides it for one run)
+- Common flags: `--port`, `--password`, `--host`, `--allow-cidrs`, `--color-level 8|16|24`, `--fps`, `--scale`, `--share-dir`, `--debug`, `--tls`, `--confirm`, `--no-confirm`
 
 ## TLS / VeNCrypt
 
@@ -77,7 +79,6 @@ restsend-vnc --tls off         # plaintext only
 A self-signed ECDSA certificate is generated on first use and stored in
 `%APPDATA%\restsend-vnc\tls\` (`server.crt` / `server.key`). Provide a real
 certificate with:
-
 ```bash
 restsend-vnc --tls required --tls-cert C:\cert\server.pem --tls-key C:\cert\server.key
 ```
@@ -89,6 +90,11 @@ attacker who can modify the network can strip the VeNCrypt offer and force the
 plaintext fallback, so use `required` on untrusted networks. File transfer uses
 the TightVNC extension, which is only negotiated with the Tight security type:
 in required TLS mode file transfer is unavailable.
+
+VeNCrypt uses the X.509 sub-types (X509None/X509Vnc), so the viewer verifies
+the server certificate and shows the usual self-signed prompt. The legacy
+anonymous TLS sub-types (TLSNone/TLSVnc) are not offered because rustls does
+not implement anonymous cipher suites.
 
 ## Build
 
@@ -102,6 +108,9 @@ cargo build --release --target x86_64-pc-windows-gnu --no-default-features
 ```
 
 Artifact: `target/x86_64-pc-windows-gnu/release/restsend-vnc.exe`
+
+The release profile uses fat LTO and one codegen unit; the win64 build is
+about 3.8 MB (down from 4.9 MB with thin LTO).
 
 ## Notes
 

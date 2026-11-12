@@ -58,13 +58,6 @@ name = "cli"
 path = "examples/cli.rs"
 doc-scrape-examples = false
 
-[dependencies.clap]
-version = "4.5.20"
-features = ["derive"]
-
-[dependencies.ctrlc]
-version = "3.4.5"
-
 [dependencies.parking_lot]
 version = "0.12.3"
 

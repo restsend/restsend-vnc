@@ -93,6 +93,8 @@ fn vencrypt_tls_session_reaches_framebuffer_update() {
             "--test-pattern",
             "--no-auth",
             "--no-confirm",
+            "--allow-cidrs",
+            "127.0.0.1/32",
             "--tls",
             "required",
             "--tls-cert",
@@ -142,8 +144,9 @@ fn vencrypt_tls_session_reaches_framebuffer_update() {
         .iter()
         .map(|c| u32::from_be_bytes(*c))
         .collect();
-    assert_eq!(subtypes, vec![257], "no password => TLSNone");
-    s.write_all(&257u32.to_be_bytes()).unwrap();
+    assert_eq!(subtypes, vec![260], "no password => X509None");
+    s.write_all(&260u32.to_be_bytes()).unwrap();
+    assert_eq!(read_u8(&mut s), 1, "VeNCrypt X509 ACK");
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add(cert_der).unwrap();

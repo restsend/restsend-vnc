@@ -21,6 +21,12 @@ pub struct Cli {
     #[arg(long)]
     pub host: Option<String>,
 
+    /// Only accept peers matching these CIDR ranges (comma or space
+    /// separated). Empty means allow all; loopback is not implicit, so add
+    /// 127.0.0.1/32 for local viewers.
+    #[arg(long, value_name = "LIST")]
+    pub allow_cidrs: Option<String>,
+
     /// Listen port (default VNC port 5900)
     #[arg(long, default_value_t = 5900)]
     pub port: u16,
@@ -129,6 +135,8 @@ pub struct Cli {
 pub struct Config {
     /// Explicit --host (None => 0.0.0.0 unless the tray says loopback-only).
     pub host: Option<String>,
+    /// Explicit --allow-cidrs override for this run.
+    pub allow_cidrs: Option<String>,
     pub port: u16,
     pub password: Option<String>,
     pub view_only: bool,
@@ -227,8 +235,13 @@ impl Config {
             return Err("--confirm and --no-confirm cannot be used together".into());
         }
 
+        if let Some(raw) = &cli.allow_cidrs {
+            crate::acl::check(raw).map_err(|e| format!("--allow-cidrs {raw:?}: {e}"))?;
+        }
+
         Ok(Config {
             host: cli.host,
+            allow_cidrs: cli.allow_cidrs,
             port: cli.port,
             password,
             view_only: cli.view_only,

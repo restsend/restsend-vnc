@@ -2,10 +2,12 @@
 //! the tray UI and the debug overlay.
 
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::acl::Acl;
 use crate::rfb::filetransfer::ShareRoot;
 use crate::tls::Mode;
 
@@ -30,6 +32,8 @@ pub struct Settings {
     pub loopback_only: bool,
     /// Ask the local user to accept every new connection before ServerInit.
     pub confirm_connections: bool,
+    /// Optional CIDR allow-list for incoming peers (empty = allow all).
+    pub allow_cidrs: String,
     pub keep_awake: bool,
     pub allow_debug: bool,
     pub url: String,
@@ -55,6 +59,7 @@ impl Default for Settings {
             color_level: 16,
             loopback_only: false,
             confirm_connections: false,
+            allow_cidrs: String::new(),
             keep_awake: true,
             allow_debug: true,
             url: DEFAULT_URL.to_string(),
@@ -77,6 +82,8 @@ pub static COLOR_LEVEL: AtomicU8 = AtomicU8::new(16);
 pub static LOOPBACK_ONLY: AtomicBool = AtomicBool::new(false);
 /// Ask the local user to accept each new connection (live, applies at once).
 pub static CONFIRM_CONNECTIONS: AtomicBool = AtomicBool::new(false);
+/// CIDR allow-list for incoming peers (live, applies to new connections).
+static ACL: OnceLock<Mutex<Arc<Acl>>> = OnceLock::new();
 pub static KEEP_AWAKE: AtomicBool = AtomicBool::new(true);
 pub static ALLOW_DEBUG: AtomicBool = AtomicBool::new(true);
 /// Encryption policy (0 = off, 1 = auto/prefer TLS, 2 = required).
@@ -151,6 +158,42 @@ pub fn share_files() -> bool {
 /// True when each new connection must be accepted by the local user.
 pub fn confirm_connections() -> bool {
     CONFIRM_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+fn acl_cell() -> &'static Mutex<Arc<Acl>> {
+    ACL.get_or_init(|| Mutex::new(Arc::new(Acl::default())))
+}
+
+/// Snapshot of the live allow-list. Cheap (Arc clone) and safe to keep for
+/// the duration of one accept() decision.
+pub fn acl() -> Arc<Acl> {
+    acl_cell().lock().unwrap().clone()
+}
+
+/// True when `ip` may connect. Empty list = allow all; malformed list denies.
+pub fn allows(ip: IpAddr) -> bool {
+    acl().allows(ip)
+}
+
+/// Replaces the live allow-list and logs whether it is active.
+pub fn set_allow_cidrs(raw: &str) {
+    let acl = Acl::parse(raw);
+    if !acl.invalid_entries().is_empty() {
+        tracing::error!(
+            "allow_cidrs contains invalid entries {:?}; all connections will be refused",
+            acl.invalid_entries()
+        );
+    } else if acl.is_empty() {
+        tracing::debug!("allow_cidrs is empty (all peers allowed)");
+    } else {
+        tracing::info!("allow_cidrs active: {}", acl.raw());
+    }
+    *acl_cell().lock().unwrap() = Arc::new(acl);
+}
+
+/// Raw allow-list as persisted (used by the tray Settings snapshot).
+pub fn allow_cidrs_raw() -> String {
+    acl().raw().to_string()
 }
 
 /// Resolves the live share root for new connections. `None` means the
@@ -261,6 +304,7 @@ pub fn load() -> Settings {
             "confirm_connections" => {
                 s.confirm_connections = v == "1" || v.eq_ignore_ascii_case("true")
             }
+            "allow_cidrs" => s.allow_cidrs = v.to_string(),
             "keep_awake" => s.keep_awake = v == "1" || v.eq_ignore_ascii_case("true"),
             "allow_debug" => s.allow_debug = v == "1" || v.eq_ignore_ascii_case("true"),
             "title" => s.title = v.to_string(),
@@ -313,11 +357,12 @@ pub fn save(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nconfirm_connections={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nshare_files={}\nshare_dir={}\ntls={}\ntls_cert={}\ntls_key={}\nurl={}\n",
+        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nconfirm_connections={}\nallow_cidrs={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nshare_files={}\nshare_dir={}\ntls={}\ntls_cert={}\ntls_key={}\nurl={}\n",
         s.port,
         s.color_level,
         s.loopback_only as u8,
         s.confirm_connections as u8,
+        s.allow_cidrs,
         s.keep_awake as u8,
         s.allow_debug as u8,
         s.password.clone().unwrap_or_default(),
@@ -341,6 +386,7 @@ pub fn apply_live(s: &Settings) {
     COLOR_LEVEL.store(s.color_level, Ordering::Relaxed);
     let old_loop = LOOPBACK_ONLY.swap(s.loopback_only, Ordering::Relaxed);
     CONFIRM_CONNECTIONS.store(s.confirm_connections, Ordering::Relaxed);
+    set_allow_cidrs(&s.allow_cidrs);
     KEEP_AWAKE.store(s.keep_awake, Ordering::Relaxed);
     ALLOW_DEBUG.store(s.allow_debug, Ordering::Relaxed);
     SHARE_FILES.store(s.share_files, Ordering::Relaxed);
@@ -373,6 +419,7 @@ pub fn current() -> Settings {
         color_level: COLOR_LEVEL.load(Ordering::Relaxed),
         loopback_only: LOOPBACK_ONLY.load(Ordering::Relaxed),
         confirm_connections: confirm_connections(),
+        allow_cidrs: allow_cidrs_raw(),
         keep_awake: KEEP_AWAKE.load(Ordering::Relaxed),
         allow_debug: ALLOW_DEBUG.load(Ordering::Relaxed),
         url: url(),
