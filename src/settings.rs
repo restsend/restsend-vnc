@@ -18,6 +18,8 @@ pub struct Settings {
     pub url: String,
     pub password: Option<String>,
     pub title: String,
+    pub autostart: bool,
+    pub logon_task: bool,
 }
 
 impl Default for Settings {
@@ -31,6 +33,8 @@ impl Default for Settings {
             url: DEFAULT_URL.to_string(),
             password: None,
             title: "restsend-vnc".to_string(),
+            autostart: false,
+            logon_task: false,
         }
     }
 }
@@ -127,6 +131,8 @@ pub fn load() -> Settings {
             "keep_awake" => s.keep_awake = v == "1" || v.eq_ignore_ascii_case("true"),
             "allow_debug" => s.allow_debug = v == "1" || v.eq_ignore_ascii_case("true"),
             "title" => s.title = v.to_string(),
+            "autostart" => s.autostart = v == "1" || v.eq_ignore_ascii_case("true"),
+            "logon_task" => s.logon_task = v == "1" || v.eq_ignore_ascii_case("true"),
             "password" => {
                 s.password = if v.is_empty() { None } else { Some(v.to_string()) };
             }
@@ -147,7 +153,7 @@ pub fn save(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nurl={}\n",
+        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nurl={}\n",
         s.port,
         s.color_level,
         s.loopback_only as u8,
@@ -155,6 +161,8 @@ pub fn save(s: &Settings) {
         s.allow_debug as u8,
         s.password.clone().unwrap_or_default(),
         s.title,
+        s.autostart as u8,
+        s.logon_task as u8,
         s.url
     );
     if let Ok(mut f) = std::fs::File::create(&path) {
@@ -177,6 +185,14 @@ pub fn apply_live(s: &Settings) {
     }
 }
 
+static LOGON_TASK: AtomicBool = AtomicBool::new(false);
+pub fn set_autostart_task(on: bool) {
+    LOGON_TASK.store(on, Ordering::Relaxed);
+}
+fn logon_task_flag() -> bool {
+    LOGON_TASK.load(Ordering::Relaxed)
+}
+
 pub fn current() -> Settings {
     Settings {
         port: PORT.load(Ordering::Relaxed),
@@ -187,5 +203,7 @@ pub fn current() -> Settings {
         url: url(),
         password: password(),
         title: title(),
+        autostart: crate::autostart::enabled(),
+        logon_task: logon_task_flag(),
     }
 }

@@ -41,6 +41,8 @@ const C_KEEP: i32 = 1004;
 const C_DEBUG: i32 = 1005;
 const C_PASS: i32 = 1007;
 const C_TITLE: i32 = 1008;
+const C_AUTOSTART: i32 = 1009;
+const C_ELEVATE: i32 = 1010;
 
 static UI_FONT: AtomicIsize = AtomicIsize::new(0);
 
@@ -258,7 +260,7 @@ unsafe fn open_settings() {
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         480,
-        380,
+        440,
         None,
         None,
         Some(hinst.into()),
@@ -413,10 +415,39 @@ unsafe fn open_settings() {
     ctrl(
         hwnd,
         w!("BUTTON"),
+        w!("Start with Windows (current user)"),
+        check,
+        f(18),
+        f(246),
+        f(420),
+        f(24),
+        C_AUTOSTART,
+        hi,
+    );
+    let _ = CheckDlgButton(hwnd, C_AUTOSTART, DLG_BUTTON_CHECK_STATE(if s.autostart { 1 } else { 0 }));
+
+    let elevate = ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Install elevated autostart (admin)"),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        f(18),
+        f(280),
+        f(300),
+        f(30),
+        C_ELEVATE,
+        hi,
+    );
+    // UAC shield on the button (Common Controls v6).
+    SendMessageW(elevate, 0x160C, Some(WPARAM(0)), Some(LPARAM(1)));
+
+    ctrl(
+        hwnd,
+        w!("BUTTON"),
         w!("Save"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
         f(250),
-        f(270),
+        f(340),
         f(90),
         f(30),
         1,
@@ -428,7 +459,7 @@ unsafe fn open_settings() {
         w!("Cancel"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         f(350),
-        f(270),
+        f(340),
         f(90),
         f(30),
         2,
@@ -480,6 +511,7 @@ unsafe extern "system" fn settings_proc(
                     loopback_only: IsDlgButtonChecked(hwnd, C_LOOPBACK) == 1,
                     keep_awake: IsDlgButtonChecked(hwnd, C_KEEP) == 1,
                     allow_debug: IsDlgButtonChecked(hwnd, C_DEBUG) == 1,
+                    autostart: IsDlgButtonChecked(hwnd, C_AUTOSTART) == 1,
                     password: {
                         let p = read_text(hwnd, C_PASS);
                         if p.is_empty() { None } else { Some(p) }
@@ -490,13 +522,26 @@ unsafe extern "system" fn settings_proc(
                     },
                     // Site URL is not edited here; keep the configured/default one.
                     url: crate::settings::url(),
+                    logon_task: crate::settings::current().logon_task,
                 };
                 crate::settings::save(&s);
                 crate::settings::apply_live(&s);
+                crate::autostart::set(s.autostart);
                 tracing::info!("tray: settings saved ({s:?})");
                 let _ = DestroyWindow(hwnd);
             } else if id == 2 {
                 let _ = DestroyWindow(hwnd);
+            } else if id == C_ELEVATE as usize {
+                let exe = std::env::current_exe().unwrap_or_default();
+                let exe_w = wide(&exe.display().to_string());
+                ShellExecuteW(
+                    Some(hwnd),
+                    w!("runas"),
+                    PCWSTR(exe_w.as_ptr()),
+                    w!("--install-task"),
+                    PCWSTR::null(),
+                    SW_SHOWNORMAL,
+                );
             }
         }
         WM_CLOSE => {

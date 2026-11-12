@@ -14,6 +14,8 @@ mod rfb;
 mod screen;
 mod server;
 mod settings;
+mod autostart;
+mod audit;
 #[cfg(target_os = "windows")]
 mod tray;
 mod session;
@@ -27,13 +29,21 @@ use clap::Parser;
 
 fn main() {
     let cli = Cli::parse();
+    if cli.install_task {
+        install_logon_task(true);
+        return;
+    }
+    if cli.remove_task {
+        install_logon_task(false);
+        return;
+    }
 
-    // Logging: RUST_LOG wins; otherwise info (debug with -v).
+    // Logging: RUST_LOG wins; otherwise warn (debug with -v).
     let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
         if cli.verbose {
             "restsend_vnc=debug".into()
         } else {
-            "info".into()
+            "warn".into()
         }
     });
     #[cfg(all(target_os = "windows", feature = "gui"))]
@@ -363,5 +373,55 @@ fn fatal_dialog(msg: &str) {
     #[cfg(not(all(target_os = "windows", feature = "gui")))]
     {
         eprintln!("error: {msg}");
+    }
+}
+
+
+/// Creates/removes a logon scheduled task with highest privileges (the
+/// practical equivalent of a service for screen capture, which cannot run in
+/// session 0). The tray button launches this elevated via `--install-task`.
+fn install_logon_task(install: bool) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let mut cmd = std::process::Command::new("schtasks");
+    if install {
+        cmd.args([
+            "/Create",
+            "/F",
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "HIGHEST",
+            "/TN",
+            "restsend-vnc",
+            "/TR",
+            &format!("\"{}\"", exe.display()),
+        ]);
+    } else {
+        cmd.args(["/Delete", "/F", "/TN", "restsend-vnc"]);
+    }
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+    crate::settings::set_autostart_task(install);
+    let msg = if install {
+        "Elevated logon task installed (runs at sign-in as administrator)."
+    } else {
+        "Elevated logon task removed."
+    };
+    let text: Vec<u16> = format!("{}\n\n{}", msg, if ok { "OK" } else { "Failed" })
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    #[cfg(target_os = "windows")]
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            None,
+            windows::core::PCWSTR(text.as_ptr()),
+            windows::core::w!("restsend-vnc"),
+            windows::Win32::UI::WindowsAndMessaging::MB_OK,
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = text;
+        eprintln!("{msg}");
     }
 }

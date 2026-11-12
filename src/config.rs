@@ -51,6 +51,14 @@ pub struct Cli {
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=9))]
     pub zrle_level: u32,
 
+    /// Internal: install an elevated logon task (used by the tray button).
+    #[arg(long, hide = true)]
+    pub install_task: bool,
+
+    /// Internal: remove the elevated logon task.
+    #[arg(long, hide = true)]
+    pub remove_task: bool,
+
     /// Draw a live stats overlay (capture/push fps, throughput, encode ms,
     /// dropped frames) in the bottom-right corner.
     #[arg(long)]

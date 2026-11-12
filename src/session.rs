@@ -102,8 +102,8 @@ pub fn handle_client(
         }
     };
     state.set_peer(peer.to_string());
-    state.set_client_info(format!(
-        "RFB 3.{:02} {}{}",
+    let client_info = format!(
+        "RFB3.{:02} {}{}",
         hs.minor,
         match hs.auth {
             crate::rfb::handshake::AuthMethod::None => "NONE",
@@ -111,7 +111,10 @@ pub fn handle_client(
             crate::rfb::handshake::AuthMethod::AppleDh => "APPLE-DH",
         },
         if hs.tight { " TIGHT" } else { "" }
-    ));
+    );
+    state.set_client_info(client_info.clone());
+    crate::audit::log("connect", &peer, &client_info, None);
+    let session_started = Instant::now();
     tracing::info!(
         "handshake from {peer}: rfb 3.{:02}, security type {}, auth={:?}, tight={}",
         hs.minor,
@@ -357,6 +360,17 @@ pub fn handle_client(
         }
         None => session.run(&mut reader, peer),
     };
+    let duration = session_started.elapsed();
+    let reason = match &result {
+        Ok(()) => "closed".to_string(),
+        Err(e) => e.to_string(),
+    };
+    crate::audit::log(
+        "disconnect",
+        &peer,
+        &format!("{client_info} reason={reason}"),
+        Some(duration),
+    );
     session.hub.unregister(session.session_id);
     session.state.clear_session();
     drop(session.tx); // closes channel -> writer exits
