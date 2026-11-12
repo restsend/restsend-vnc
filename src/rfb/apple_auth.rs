@@ -164,13 +164,22 @@ pub fn auto_pasteboard_info(cmd: u8) -> [u8; 8] {
 pub struct AppleStreamCipher {
     key: [u8; 16],
     iv: [u8; 16],
+    initial_iv: [u8; 16],
+    /// Reset the CBC IV for every record (some clients do not chain).
+    reset_iv: bool,
     /// Per-record SHA1 prefix counter (`viewer->0x914`, starts at 0).
     pub seq: u32,
 }
 
 impl AppleStreamCipher {
     pub fn new(key: [u8; 16], iv: [u8; 16], seq: u32) -> Self {
-        AppleStreamCipher { key, iv, seq }
+        AppleStreamCipher {
+            key,
+            iv,
+            initial_iv: iv,
+            reset_iv: false,
+            seq,
+        }
     }
 
     fn cbc_encrypt(&mut self, data: &mut [u8]) {
@@ -201,9 +210,19 @@ impl AppleStreamCipher {
         sha.update(&out[..body]);
         out[body..].copy_from_slice(&sha.finalize());
         self.seq = self.seq.wrapping_add(1);
+        if self.reset_iv {
+            self.iv = self.initial_iv;
+        }
 
         self.cbc_encrypt(&mut out);
         out
+    }
+}
+
+impl AppleStreamCipher {
+    pub fn with_iv_reset(mut self, reset: bool) -> Self {
+        self.reset_iv = reset;
+        self
     }
 }
 

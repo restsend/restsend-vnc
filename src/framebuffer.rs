@@ -322,6 +322,14 @@ impl ScreenState {
     /// watchdog checks this counter to tell "capture is alive" from "capture
     /// stalled because the desktop is locked".
     pub fn publish_capture(&self, frame: Frame) {
+        // Throttle the capture side to --fps. Windows.Graphics.Capture emits
+        // frames on every screen change and can exceed the requested rate
+        // (e.g. 50-120 fps while dragging); dropping the excess here keeps
+        // CAP <= --fps and avoids quantise/lock/wakeup work for frames the
+        // pusher would never send anyway.
+        if !self.throttle_open() {
+            return;
+        }
         self.capture_generation.fetch_add(1, Ordering::Relaxed);
         {
             let mut st = self.stats.lock().unwrap();

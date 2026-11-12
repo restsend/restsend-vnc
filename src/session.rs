@@ -162,10 +162,18 @@ pub fn handle_client(
         init.extend_from_slice(&flags.to_be_bytes()); // flags (bit0/bit1)
         // Server info block (AppleVNCServer's gServerInfo: magic + feature
         // flags; the default table advertises commands 34..39).
-        init.extend_from_slice(&[
+        // Capability bitmask. Byte 2 bit 5 (command 18) advertises stream
+        // encryption; clearing it keeps frames plaintext while the clipboard
+        // bits (commands 25/35, byte 3 bit 6 / byte 4 bit 4) stay set.
+        let no_enc = std::env::var_os("RVNC_APPLE_NO_ENC").is_some();
+        let mut caps = [
             0xbf, 0xf6, 0xe7, 0xe3, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00,
-        ]);
+        ];
+        if no_enc {
+            caps[2] &= !0x20;
+        }
+        init.extend_from_slice(&caps);
         init.extend_from_slice(cfg.name.as_bytes());
     } else {
         init.extend_from_slice(&(cfg.name.len() as u32).to_be_bytes());
@@ -184,7 +192,8 @@ pub fn handle_client(
     // subsequent server->client message with AES-128-CBC.
     let mut pending_setup: Option<Vec<u8>> = None;
     let mut pending_cipher: Option<crate::rfb::apple_auth::AppleStreamCipher> = None;
-    if extended {
+    let apple_no_enc = std::env::var_os("RVNC_APPLE_NO_ENC").is_some();
+    if extended && !apple_no_enc {
         if let Some(dh) = hs.apple_key {
             let mut key = [0u8; 16];
             let mut iv = [0u8; 16];
@@ -197,7 +206,11 @@ pub fn handle_client(
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            pending_cipher = Some(crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, seq0));
+            let reset = std::env::var_os("RVNC_APPLE_CBC_RESET").is_some();
+            pending_cipher = Some(
+                crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, seq0)
+                    .with_iv_reset(reset),
+            );
         }
     }
 
@@ -589,6 +602,12 @@ impl Updater {
                     snap.dims()
                 };
                 let t0 = Instant::now();
+                if std::env::var_os("RVNC_NO_FRAMES").is_some() {
+                    // Experiment: keep the session alive without frames.
+                    first = false;
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
                 let complete =
                     self.send_update(incremental, Rect::new(0, 0, u16::MAX, u16::MAX))
                         .unwrap_or(false);
