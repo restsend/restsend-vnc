@@ -634,17 +634,6 @@ unsafe fn open_settings() {
         Some(WPARAM(font.0 as usize)),
         Some(LPARAM(1)),
     );
-    // Keep the tab strip at the bottom of the sibling z-order so it cannot
-    // paint its body over the page controls.
-    let _ = SetWindowPos(
-        tab,
-        Some(HWND_BOTTOM),
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-    );
 
     // --- General page ------------------------------------------------------
     let mut general: Vec<HWND> = Vec::new();
@@ -1087,7 +1076,6 @@ unsafe fn open_settings() {
         let to_isize = |v: Vec<HWND>| v.into_iter().map(|h| h.0 as isize).collect::<Vec<_>>();
         *pages.borrow_mut() = vec![to_isize(general), to_isize(security), to_isize(files)];
     });
-    show_settings_page(hwnd, 0);
 
     ctrl(
         hwnd,
@@ -1114,7 +1102,20 @@ unsafe fn open_settings() {
         hi,
     );
 
-    // All controls exist: force the first complete paint.
+    // All page controls (and Save/Cancel) exist now. Only now move the tab
+    // strip to the bottom of the sibling z-order: child windows created later
+    // are inserted below it, so moving it earlier would leave it above the
+    // page controls and hide them.
+    let _ = SetWindowPos(
+        tab,
+        Some(HWND_BOTTOM),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    show_settings_page(hwnd, 0);
     let _ = RedrawWindow(
         Some(hwnd),
         None,
