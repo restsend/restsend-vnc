@@ -2,3 +2,4 @@
 /dist
 Cargo.lock.bak
 *.log
+/dist-ci

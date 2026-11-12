@@ -15,8 +15,9 @@ use std::time::Instant;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET,
-    DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HBRUSH, HFONT, OUT_DEFAULT_PRECIS,
+    CreateFontW, InvalidateRect, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HBRUSH, HFONT,
+    OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
@@ -320,7 +321,7 @@ unsafe fn ensure_ui_font(scale: f32) -> HFONT {
     font
 }
 
-unsafe fn show_settings_page(index: usize) {
+unsafe fn show_settings_page(hwnd: HWND, index: usize) {
     SETTINGS_PAGES.with(|pages| {
         let pages = pages.borrow();
         for (i, group) in pages.iter().enumerate() {
@@ -330,6 +331,11 @@ unsafe fn show_settings_page(index: usize) {
             }
         }
     });
+    // The page controls are siblings of the tab control. Repaint the page
+    // immediately so STATIC labels are not left blank until the next tab
+    // switch (the tab body can otherwise paint after them).
+    let _ = InvalidateRect(Some(hwnd), None, true);
+    let _ = UpdateWindow(hwnd);
 }
 
 /// Called by the tray timer: show the next pending connection request.
@@ -544,7 +550,12 @@ unsafe fn open_settings() {
     // Per-Monitor V2: scale coordinates/fonts by the system DPI, and derive
     // the OUTER window size from the desired CLIENT area so bottom controls
     // are never clipped by the caption/borders.
-    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    //
+    // Create the window hidden: it is shown only after all controls and the
+    // initial tab page exist. Showing it earlier lets Windows paint the tab
+    // body before the STATIC labels are created, which left them blank until
+    // the next tab switch.
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     let dpi = GetDpiForSystem() as f32;
     let scale = (dpi / 96.0).max(1.0);
     let f = |v: i32| ((v as f32) * scale).round() as i32;
@@ -576,10 +587,10 @@ unsafe fn open_settings() {
 
     let s = crate::settings::load();
     let hi = hinst.0 as isize;
-    let label: WINDOW_STYLE = WS_CHILD | WS_VISIBLE;
-    let edit: WINDOW_STYLE = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP;
+    let label: WINDOW_STYLE = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS;
+    let edit: WINDOW_STYLE = WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_BORDER | WS_TABSTOP;
     let check: WINDOW_STYLE =
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32);
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32);
 
     let font = ensure_ui_font(scale);
     SendMessageW(
@@ -623,6 +634,17 @@ unsafe fn open_settings() {
         WM_SETFONT,
         Some(WPARAM(font.0 as usize)),
         Some(LPARAM(1)),
+    );
+    // Keep the tab strip at the bottom of the sibling z-order so it cannot
+    // paint its body over the page controls.
+    let _ = SetWindowPos(
+        tab,
+        Some(HWND_BOTTOM),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
     );
 
     // --- General page ------------------------------------------------------
@@ -1066,7 +1088,7 @@ unsafe fn open_settings() {
         let to_isize = |v: Vec<HWND>| v.into_iter().map(|h| h.0 as isize).collect::<Vec<_>>();
         *pages.borrow_mut() = vec![to_isize(general), to_isize(security), to_isize(files)];
     });
-    show_settings_page(0);
+    show_settings_page(hwnd, 0);
 
     ctrl(
         hwnd,
@@ -1092,6 +1114,11 @@ unsafe fn open_settings() {
         2,
         hi,
     );
+
+    // All controls exist: now make the window visible and force the first
+    // complete paint.
+    let _ = ShowWindow(hwnd, SW_SHOW);
+    let _ = UpdateWindow(hwnd);
 
     let mut msg = MSG::default();
     while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1270,7 +1297,7 @@ unsafe extern "system" fn settings_proc(
                 let tab = GetDlgItem(Some(hwnd), C_TABS).unwrap_or_default();
                 let index =
                     SendMessageW(tab, TCM_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))).0 as usize;
-                show_settings_page(index);
+                show_settings_page(hwnd, index);
             }
         }
         WM_DESTROY => {

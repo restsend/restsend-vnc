@@ -8,8 +8,8 @@
 //!
 //! The pointer is handled separately (cursor pseudo-encoding or a
 //! server-composited overlay), so cursor capture is disabled when the OS
-//! supports that setting. The capture border is disabled on Windows 11; on
-//! older builds the OS-mandated border is left alone instead of failing.
+//! supports that setting. The OS capture border is kept as the visual
+//! "screen is being shared" reminder.
 
 use std::io;
 use std::sync::Arc;
@@ -218,12 +218,10 @@ fn capture_session(
         tracing::warn!("this Windows build cannot disable cursor capture");
         CursorCaptureSettings::Default
     };
-    let border = if GraphicsCaptureApi::is_border_settings_supported().unwrap_or(false) {
-        DrawBorderSettings::WithoutBorder
-    } else {
-        tracing::warn!("this Windows build cannot disable the capture border");
-        DrawBorderSettings::Default
-    };
+    // Keep the OS capture border: it is the visible reminder that the screen
+    // is being shared, and it matches the previous scap behaviour. On old
+    // Windows builds, requesting "no border" would fail the whole session.
+    let border = DrawBorderSettings::Default;
     let interval = if GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(false) {
         MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(
             1_000_000_000 / u64::from(fps.max(1)),
