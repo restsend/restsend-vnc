@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, ShellExecuteW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
@@ -24,7 +24,7 @@ use windows::Win32::UI::Controls::{
     CheckDlgButton, DLG_BUTTON_CHECK_STATE, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES,
     INITCOMMONCONTROLSEX, InitCommonControlsEx, IsDlgButtonChecked,
 };
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -251,16 +251,31 @@ unsafe fn open_settings() {
     };
     RegisterClassW(&wc);
 
-    // Per-Monitor V2: scale every coordinate/font by the window DPI.
+    // Per-Monitor V2: scale coordinates/fonts by the system DPI, and derive
+    // the OUTER window size from the desired CLIENT area so bottom controls
+    // are never clipped by the caption/borders.
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    let dpi = GetDpiForSystem() as f32;
+    let scale = (dpi / 96.0).max(1.0);
+    let f = |v: i32| ((v as f32) * scale).round() as i32;
+
+    let mut wr = RECT {
+        left: 0,
+        top: 0,
+        right: f(480),
+        bottom: f(400),
+    };
+    let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
+
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class,
         w!("restsend-vnc settings"),
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        style,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        480,
-        440,
+        wr.right - wr.left,
+        wr.bottom - wr.top,
         None,
         None,
         Some(hinst.into()),
@@ -268,23 +283,6 @@ unsafe fn open_settings() {
     )
     .unwrap();
 
-    let dpi = GetDpiForWindow(hwnd) as f32;
-    let scale = (dpi / 96.0).max(1.0);
-    let f = |v: i32| ((v as f32) * scale).round() as i32;
-
-    // Resize with the scaled size.
-    let _ = SetWindowPos(
-        hwnd,
-        None,
-        0,
-        0,
-        f(480),
-        f(330),
-        SWP_NOMOVE | SWP_NOZORDER,
-    );
-
-    // Show the file-backed values in the UI, not CLI overrides: saving the
-    // dialog must never write command-line values into settings.ini.
     let s = crate::settings::load();
     let hi = hinst.0 as isize;
     let label: WINDOW_STYLE = WS_CHILD | WS_VISIBLE;
