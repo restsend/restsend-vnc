@@ -78,11 +78,12 @@ fn encode_tile(
     let first: [u8; 4] = frame.bgra[base..base + 4].try_into().unwrap();
 
     let mut uniform = true;
+    let first_u32 = u32::from_ne_bytes(first);
     'rows: for dy in 0..th {
         let off = (ty + dy) * stride + tx * 4;
         let row = &frame.bgra[off..off + tw * 4];
         for px in row.chunks_exact(4) {
-            if px != first {
+            if u32::from_ne_bytes([px[0], px[1], px[2], px[3]]) != first_u32 {
                 uniform = false;
                 break 'rows;
             }
