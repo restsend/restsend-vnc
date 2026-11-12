@@ -38,52 +38,17 @@ fn local_string() -> Option<String> {
 }
 
 fn main() {
-    // Windows icon + manifest resource.
+    // Windows icon + manifest resource. `embed-resource` locates the right
+    // compiler for the target (windres for *-windows-gnu, rc.exe/llvm-rc for
+    // *-windows-msvc) instead of relying on it being on PATH. This matters on
+    // GitHub Actions, where rc.exe is present in the Windows SDK but not on
+    // PATH; the old manual code silently produced an exe without the icon or
+    // the Common Controls v6 manifest.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=assets/rvnc.rc");
         println!("cargo:rerun-if-changed=assets/rvnc.ico");
         println!("cargo:rerun-if-changed=assets/rvnc.manifest");
-        let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-        let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-
-        if env == "msvc" {
-            // Windows SDK resource compiler; link.exe accepts the .res file.
-            // Not always on PATH: if it is missing we still build, just with
-            // the default exe icon.
-            let res = out.join("restsend_vnc_icon.res");
-            let st = std::process::Command::new("rc.exe")
-                .arg("/nologo")
-                .arg("/fo")
-                .arg(&res)
-                .arg("assets/rvnc.rc")
-                .status();
-            match st {
-                Ok(s) if s.success() => {
-                    println!("cargo:rustc-link-arg-bins={}", res.display());
-                }
-                _ => println!("cargo:warning=rc.exe unavailable/failed; default icon used"),
-            }
-        } else {
-            let windres = if arch == "x86" {
-                "i686-w64-mingw32-windres"
-            } else {
-                "x86_64-w64-mingw32-windres"
-            };
-            let obj = out.join("restsend_vnc_icon.o");
-            let st = std::process::Command::new(windres)
-                .arg("-i")
-                .arg("assets/rvnc.rc")
-                .arg("-o")
-                .arg(&obj)
-                .status();
-            match st {
-                Ok(s) if s.success() => {
-                    println!("cargo:rustc-link-arg-bins={}", obj.display());
-                }
-                _ => println!("cargo:warning=windres unavailable/failed; default icon used"),
-            }
-        }
+        let _ = embed_resource::compile("assets/rvnc.rc", embed_resource::NONE).manifest_optional();
     }
 
     // Build timestamp embedded into the binary; `rvnc --version` shows it so
