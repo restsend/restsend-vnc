@@ -194,7 +194,15 @@ pub fn perform(
     password: Option<&str>,
     allow_tight: bool,
 ) -> HsResult<HandshakeResult> {
-    writer.write_all(PROTOCOL_STRING)?;
+    // Experiment: announce 3.3 / 3.8 to see if Screen Sharing.app accepts a
+    // standard RFB session (which would give us the standard clipboard).
+    let version: &[u8; 12] = match std::env::var("RVNC_RFB_VER").as_deref() {
+        Ok("33") => b"RFB 003.003\n",
+        Ok("37") => b"RFB 003.007\n",
+        Ok("38") => b"RFB 003.008\n",
+        _ => PROTOCOL_STRING,
+    };
+    writer.write_all(version)?;
     writer.flush()?;
 
     let mut version = [0u8; 12];
@@ -219,9 +227,13 @@ pub fn perform(
     // then abort the challenge, so type 2 must not be offered to them.
     let mut offered: Vec<u8> = Vec::new();
     if apple_client {
-        // Always offer Apple DH: Screen Sharing.app does not support the
-        // no-auth type, so even a password-less server must use type 30.
-        offered.push(SEC_APPLE_DH);
+        // No password: try the standard no-auth type first (no login prompt).
+        // With a password, Apple DH is required (the client aborts type 2).
+        if password.is_none() && std::env::var_os("RVNC_APPLE_NONE").is_some() {
+            offered.push(SEC_NONE);
+        } else {
+            offered.push(SEC_APPLE_DH);
+        }
     } else if password.is_some() {
         // Apple DH (30) is Apple-only: standard viewers such as TigerVNC
         // also implement type 30 and would pick it over plain VNC auth,

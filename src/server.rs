@@ -75,7 +75,7 @@ pub fn serve(
         let state = Arc::clone(&state);
         let hub = Arc::clone(&hub);
         let cfg = SessionConfig {
-            name: cfg.name.clone(),
+            name: crate::settings::title(),
             view_only: cfg.view_only,
             test_pattern: cfg.test_pattern,
             input_enabled: cfg.input_enabled,

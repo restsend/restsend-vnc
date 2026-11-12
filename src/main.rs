@@ -107,6 +107,9 @@ fn main() {
     if cfg.debug {
         effective.allow_debug = true;
     }
+    if cfg.name != "rvnc" {
+        effective.title = cfg.name.clone();
+    }
     settings::apply_live(&effective);
     tracing::info!(
         "settings: port={} color={} loopback_only={} keep_awake={} allow_debug={} url={}",

@@ -40,6 +40,7 @@ const C_LOOPBACK: i32 = 1003;
 const C_KEEP: i32 = 1004;
 const C_DEBUG: i32 = 1005;
 const C_PASS: i32 = 1007;
+const C_TITLE: i32 = 1008;
 
 static UI_FONT: AtomicIsize = AtomicIsize::new(0);
 
@@ -254,7 +255,7 @@ unsafe fn open_settings() {
         CW_USEDEFAULT,
         CW_USEDEFAULT,
         480,
-        330,
+        380,
         None,
         None,
         Some(hinst.into()),
@@ -385,14 +386,19 @@ unsafe fn open_settings() {
     );
     let _ = CheckDlgButton(hwnd, C_DEBUG, DLG_BUTTON_CHECK_STATE(if s.allow_debug { 1 } else { 0 }));
 
-    ctrl(hwnd, w!("STATIC"), w!("Password:"), label, f(18), f(166), f(80), f(20), 0, hi);
+    ctrl(hwnd, w!("STATIC"), w!("Title:"), label, f(18), f(166), f(80), f(20), 0, hi);
+    let title = ctrl(hwnd, w!("EDIT"), w!(""), edit, f(110), f(164), f(320), f(24), C_TITLE, hi);
+    let ttxt = wide(&s.title);
+    SetWindowTextW(title, PCWSTR(ttxt.as_ptr()));
+
+    ctrl(hwnd, w!("STATIC"), w!("Password:"), label, f(18), f(206), f(80), f(20), 0, hi);
     let pass = ctrl(
         hwnd,
         w!("EDIT"),
         w!(""),
         edit, // plain text by default (no ES_PASSWORD masking)
         f(110),
-        f(164),
+        f(204),
         f(320),
         f(24),
         C_PASS,
@@ -407,7 +413,7 @@ unsafe fn open_settings() {
         w!("Save"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
         f(250),
-        f(220),
+        f(270),
         f(90),
         f(30),
         1,
@@ -419,7 +425,7 @@ unsafe fn open_settings() {
         w!("Cancel"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         f(350),
-        f(220),
+        f(270),
         f(90),
         f(30),
         2,
@@ -474,6 +480,10 @@ unsafe extern "system" fn settings_proc(
                     password: {
                         let p = read_text(hwnd, C_PASS);
                         if p.is_empty() { None } else { Some(p) }
+                    },
+                    title: {
+                        let t = read_text(hwnd, C_TITLE);
+                        if t.trim().is_empty() { "rvnc".to_string() } else { t }
                     },
                     // Site URL is not edited here; keep the configured/default one.
                     url: crate::settings::url(),

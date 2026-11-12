@@ -17,6 +17,7 @@ pub struct Settings {
     pub allow_debug: bool,
     pub url: String,
     pub password: Option<String>,
+    pub title: String,
 }
 
 impl Default for Settings {
@@ -29,6 +30,7 @@ impl Default for Settings {
             allow_debug: true,
             url: DEFAULT_URL.to_string(),
             password: None,
+            title: "rvnc".to_string(),
         }
     }
 }
@@ -46,6 +48,20 @@ pub static EXIT: AtomicBool = AtomicBool::new(false);
 
 static URL: OnceLock<Mutex<String>> = OnceLock::new();
 static PASSWORD: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static TITLE: OnceLock<Mutex<String>> = OnceLock::new();
+
+pub fn title() -> String {
+    TITLE
+        .get_or_init(|| Mutex::new("rvnc".to_string()))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+pub fn set_title(t: &str) {
+    *TITLE.get_or_init(|| Mutex::new("rvnc".to_string())).lock().unwrap() =
+        if t.trim().is_empty() { "rvnc".to_string() } else { t.to_string() };
+}
 
 fn password_cell() -> &'static Mutex<Option<String>> {
     PASSWORD.get_or_init(|| Mutex::new(None))
@@ -110,6 +126,7 @@ pub fn load() -> Settings {
             "loopback_only" => s.loopback_only = v == "1" || v.eq_ignore_ascii_case("true"),
             "keep_awake" => s.keep_awake = v == "1" || v.eq_ignore_ascii_case("true"),
             "allow_debug" => s.allow_debug = v == "1" || v.eq_ignore_ascii_case("true"),
+            "title" => s.title = v.to_string(),
             "password" => {
                 s.password = if v.is_empty() { None } else { Some(v.to_string()) };
             }
@@ -130,13 +147,14 @@ pub fn save(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\nurl={}\n",
+        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nurl={}\n",
         s.port,
         s.color_level,
         s.loopback_only as u8,
         s.keep_awake as u8,
         s.allow_debug as u8,
         s.password.clone().unwrap_or_default(),
+        s.title,
         s.url
     );
     if let Ok(mut f) = std::fs::File::create(&path) {
@@ -152,6 +170,7 @@ pub fn apply_live(s: &Settings) {
     ALLOW_DEBUG.store(s.allow_debug, Ordering::Relaxed);
     set_url(&s.url);
     set_password(s.password.clone());
+    set_title(&s.title);
     let old_port = PORT.swap(s.port, Ordering::Relaxed);
     if old_port != s.port || old_loop != s.loopback_only {
         RELOAD.fetch_add(1, Ordering::Relaxed);
@@ -167,5 +186,6 @@ pub fn current() -> Settings {
         allow_debug: ALLOW_DEBUG.load(Ordering::Relaxed),
         url: url(),
         password: password(),
+        title: title(),
     }
 }
