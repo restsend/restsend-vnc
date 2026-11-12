@@ -14,6 +14,7 @@ Works with standard VNC viewers and with macOS built-in Screen Sharing.
 - Tray icon + native tabbed settings window (General / Security / Files): port, colour level, password, title, loopback-only, keep-awake, debug panel, shared folder, encryption
 - Optional manual connection approval: every authenticated connection can require a local Accept/Reject click; no screen data is sent before approval, and unanswered requests are rejected after 30 seconds
 - CIDR allow-list for incoming peers (Security tab or `--allow-cidrs`); empty means allow all, and a malformed list fails closed
+- Persisted **View only** mode (General tab or `--view-only`): new sessions can watch but cannot send input, clipboard or file uploads
 - macOS Screen Sharing: RFB 003.889 + Apple DH (type 30) auth, video/input, lock-screen notice
 - Debug overlay (fps, throughput, encode time, CPU, memory, versions) — toggle with `Ctrl + 3 left clicks`
 - Session audit log (client version, connect time, disconnect reason, duration, confirmation pending/accept/reject/timeout, ACL rejects)
@@ -62,7 +63,8 @@ Default listen address is `0.0.0.0`. Enable **Only accept loopback connections**
 - File transfer is **off by default**. Enable **Share files** in Settings and choose a shared folder (defaults to your user directory); new connections pick the change up immediately. `--share-dir <DIR>` enables it for the current run only
 - Connection confirmation is **off by default**. Enable **Ask before accepting incoming connections** on the Security tab (or pass `--confirm`) to require a local Accept click for each new connection. The prompt appears after authentication and before `ServerInit`; rejected, timed-out (30 s) or unattended requests are closed without sending any screen data. At most 4 requests are queued; further connections are refused. Use `--no-confirm` to override the persisted setting for one run
 - The **Allowed networks (CIDR)** field on the Security tab restricts incoming peers. Entries are comma or space separated (`192.168.1.0/24, 10.0.0.0/8`); a bare address means a single host. Leave it empty to allow all. Loopback is **not** implicit, so add `127.0.0.1/32` if local viewers must connect. Invalid entries are rejected when saving; a hand-edited invalid list fails closed. The rule applies to new connections immediately (`--allow-cidrs LIST` overrides it for one run)
-- Common flags: `--port`, `--password`, `--host`, `--allow-cidrs`, `--color-level 8|16|24`, `--fps`, `--scale`, `--share-dir`, `--debug`, `--tls`, `--confirm`, `--no-confirm`
+- **View only** on the General tab makes new sessions display-only: keyboard, mouse, clipboard and file uploads are disabled. `--view-only` forces it for one run and `--no-view-only` overrides a persisted `view_only=1`. Existing sessions keep the mode they were opened with
+- Common flags: `--port`, `--password`, `--host`, `--allow-cidrs`, `--color-level 8|16|24`, `--fps`, `--scale`, `--share-dir`, `--debug`, `--tls`, `--confirm`, `--no-confirm`, `--view-only`, `--no-view-only`
 
 ## TLS / VeNCrypt
 
@@ -116,7 +118,7 @@ about 3.8 MB (down from 4.9 MB with thin LTO).
 
 - Elevated windows (Task Manager, UAC) require running as administrator (Windows UIPI)
 - Connection confirmation fails closed: a console build prompts on stdin, and rejects the connection when no terminal/UI is available
-- Internal test hooks: `RESTSEND_VNC_APPROVAL=accept|reject|timeout` and `RESTSEND_VNC_APPROVAL_TIMEOUT_MS` bypass the prompt when confirmation is enabled (used by `tests/approval_smoke.rs`)
+- Internal test hooks: `RESTSEND_VNC_APPROVAL=accept|reject|timeout`, `RESTSEND_VNC_APPROVAL_TIMEOUT_MS`, and `RESTSEND_VNC_ALLOW_MULTIPLE=1` (bypass the single-instance mutex) are used by the integration tests
 - Apple clients only allow shared clipboard on encrypted ARD sessions
 - The debug overlay's `CLI` line ends in `[TLS]` or `[PLAIN]` so the live link's encryption is visible
 - The password is stored in plain text in `settings.ini`

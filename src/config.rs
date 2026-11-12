@@ -45,6 +45,10 @@ pub struct Cli {
     #[arg(long)]
     pub view_only: bool,
 
+    /// Disable view-only for this run (overrides a persisted view_only=1)
+    #[arg(long)]
+    pub no_view_only: bool,
+
     /// Display/output index to share (default: 0)
     #[arg(long, default_value_t = 0)]
     pub display: usize,
@@ -140,6 +144,8 @@ pub struct Config {
     pub port: u16,
     pub password: Option<String>,
     pub view_only: bool,
+    /// True when --view-only or --no-view-only was supplied.
+    pub view_only_set: bool,
     pub display: usize,
     pub fps: u32,
     /// Requested colour level (8/16/24); 24 means no quantization.
@@ -235,6 +241,10 @@ impl Config {
             return Err("--confirm and --no-confirm cannot be used together".into());
         }
 
+        if cli.view_only && cli.no_view_only {
+            return Err("--view-only and --no-view-only cannot be used together".into());
+        }
+
         if let Some(raw) = &cli.allow_cidrs {
             crate::acl::check(raw).map_err(|e| format!("--allow-cidrs {raw:?}: {e}"))?;
         }
@@ -245,6 +255,7 @@ impl Config {
             port: cli.port,
             password,
             view_only: cli.view_only,
+            view_only_set: cli.view_only || cli.no_view_only,
             display: cli.display,
             fps: cli.fps,
             debug: cli.debug,

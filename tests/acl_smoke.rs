@@ -77,6 +77,7 @@ fn spawn(port: u16, appdata: &TempAppData, extra: &[&str]) -> ChildGuard {
     ])
     .args(extra)
     .env("APPDATA", &appdata.0)
+    .env("RESTSEND_VNC_ALLOW_MULTIPLE", "1")
     .stdin(Stdio::null())
     .stdout(Stdio::null())
     .stderr(Stdio::null());
@@ -156,6 +157,7 @@ fn invalid_acl_refuses_to_start() {
             "10.0.0.0/33",
         ])
         .env("APPDATA", &appdata.0)
+        .env("RESTSEND_VNC_ALLOW_MULTIPLE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

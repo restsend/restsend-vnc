@@ -60,6 +60,7 @@ const C_BROWSE: i32 = 1013;
 const C_TLS: i32 = 1014;
 const C_CONFIRM: i32 = 1015;
 const C_ALLOW: i32 = 1016;
+const C_VIEWONLY: i32 = 1017;
 const C_TABS: i32 = 1020;
 
 const C_CC_COUNT: i32 = 1031;
@@ -783,6 +784,36 @@ unsafe fn open_settings() {
         DLG_BUTTON_CHECK_STATE(if s.autostart { 1 } else { 0 }),
     );
 
+    general.push(ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("View only (clients cannot control this PC)"),
+        check,
+        f(24),
+        f(230),
+        f(400),
+        f(24),
+        C_VIEWONLY,
+        hi,
+    ));
+    let _ = CheckDlgButton(
+        hwnd,
+        C_VIEWONLY,
+        DLG_BUTTON_CHECK_STATE(if s.view_only { 1 } else { 0 }),
+    );
+    general.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Keyboard, mouse, clipboard and file uploads are disabled.\nApplies to new connections."),
+        WS_CHILD | WS_VISIBLE,
+        f(24),
+        f(258),
+        f(400),
+        f(44),
+        0,
+        hi,
+    ));
+
     // --- Security page -----------------------------------------------------
     let mut security: Vec<HWND> = Vec::new();
     security.push(ctrl(
@@ -1166,6 +1197,7 @@ unsafe extern "system" fn settings_proc(
                     loopback_only: IsDlgButtonChecked(hwnd, C_LOOPBACK) == 1,
                     confirm_connections: IsDlgButtonChecked(hwnd, C_CONFIRM) == 1,
                     allow_cidrs,
+                    view_only: IsDlgButtonChecked(hwnd, C_VIEWONLY) == 1,
                     keep_awake: IsDlgButtonChecked(hwnd, C_KEEP) == 1,
                     allow_debug: IsDlgButtonChecked(hwnd, C_DEBUG) == 1,
                     autostart: IsDlgButtonChecked(hwnd, C_AUTOSTART) == 1,

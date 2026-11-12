@@ -94,7 +94,7 @@ fn main() {
     );
 
     #[cfg(target_os = "windows")]
-    if !single_instance_ok() {
+    if std::env::var_os("RESTSEND_VNC_ALLOW_MULTIPLE").is_none() && !single_instance_ok() {
         fatal_dialog(
             "restsend-vnc is already running.\n\nOnly one instance is allowed.\n\
              Look for the tray icon, or stop the other rvnc process first.",
@@ -136,6 +136,9 @@ fn main() {
     if let Some(cidrs) = &cfg.allow_cidrs {
         effective.allow_cidrs = cidrs.clone();
     }
+    if cfg.view_only_set {
+        effective.view_only = cfg.view_only;
+    }
     if cfg.debug {
         effective.allow_debug = true;
     }
@@ -153,12 +156,13 @@ fn main() {
     }
     settings::apply_live(&effective);
     tracing::info!(
-        "settings: port={} color={} loopback_only={} confirm_connections={} allow_cidrs={:?} keep_awake={} allow_debug={} tls={} url={}",
+        "settings: port={} color={} loopback_only={} confirm_connections={} allow_cidrs={:?} view_only={} keep_awake={} allow_debug={} tls={} url={}",
         effective.port,
         effective.color_level,
         effective.loopback_only,
         effective.confirm_connections,
         effective.allow_cidrs,
+        effective.view_only,
         effective.keep_awake,
         effective.allow_debug,
         effective.tls,
@@ -232,13 +236,13 @@ fn main() {
     }
     if cfg.test_pattern {
         tracing::info!("serving a synthetic test pattern (--test-pattern)");
-        if !cfg.view_only {
-            tracing::warn!("input is disabled in test-pattern mode");
-        }
+        tracing::warn!("input is disabled in test-pattern mode");
     }
     // --- clipboard watcher ---
+    // Always watch when clipboard sync is enabled: new sessions decide
+    // whether they may receive based on the live view-only setting.
     let hub = Arc::new(clipboard::ClipboardHub::new());
-    hub.spawn_watcher(cfg.clipboard_enabled && !cfg.view_only);
+    hub.spawn_watcher(cfg.clipboard_enabled);
 
     let auth_desc = if cfg.password.is_some() {
         "vnc auth"
@@ -252,7 +256,7 @@ fn main() {
     };
     let session_cfg = session::SessionConfig {
         name: cfg.name.clone(),
-        view_only: cfg.view_only,
+        view_only: effective.view_only,
         input_enabled: !cfg.test_pattern,
         test_pattern: cfg.test_pattern,
         share_root: cfg.share_root.clone(),
@@ -289,11 +293,11 @@ fn main() {
         };
         printed = false;
         let flags = [
-            ("view-only", cfg.view_only),
-            ("clipboard", cfg.clipboard_enabled && !cfg.view_only),
+            ("view-only", effective.view_only),
+            ("clipboard", cfg.clipboard_enabled && !effective.view_only),
             (
                 "file-transfer",
-                !cfg.view_only && (cfg.share_root.is_some() || settings::share_files()),
+                !effective.view_only && (cfg.share_root.is_some() || settings::share_files()),
             ),
             (
                 "keep-awake",

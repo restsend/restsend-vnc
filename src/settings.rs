@@ -34,6 +34,8 @@ pub struct Settings {
     pub confirm_connections: bool,
     /// Optional CIDR allow-list for incoming peers (empty = allow all).
     pub allow_cidrs: String,
+    /// Display-only sessions: ignore client input, clipboard and uploads.
+    pub view_only: bool,
     pub keep_awake: bool,
     pub allow_debug: bool,
     pub url: String,
@@ -60,6 +62,7 @@ impl Default for Settings {
             loopback_only: false,
             confirm_connections: false,
             allow_cidrs: String::new(),
+            view_only: false,
             keep_awake: true,
             allow_debug: true,
             url: DEFAULT_URL.to_string(),
@@ -84,6 +87,8 @@ pub static LOOPBACK_ONLY: AtomicBool = AtomicBool::new(false);
 pub static CONFIRM_CONNECTIONS: AtomicBool = AtomicBool::new(false);
 /// CIDR allow-list for incoming peers (live, applies to new connections).
 static ACL: OnceLock<Mutex<Arc<Acl>>> = OnceLock::new();
+/// Display-only sessions (live, applies to new connections).
+pub static VIEW_ONLY: AtomicBool = AtomicBool::new(false);
 pub static KEEP_AWAKE: AtomicBool = AtomicBool::new(true);
 pub static ALLOW_DEBUG: AtomicBool = AtomicBool::new(true);
 /// Encryption policy (0 = off, 1 = auto/prefer TLS, 2 = required).
@@ -196,6 +201,11 @@ pub fn allow_cidrs_raw() -> String {
     acl().raw().to_string()
 }
 
+/// True when new sessions should be display-only.
+pub fn view_only() -> bool {
+    VIEW_ONLY.load(Ordering::Relaxed)
+}
+
 /// Resolves the live share root for new connections. `None` means the
 /// TightVNC file-transfer extension stays disabled.
 pub fn share_root() -> Option<Arc<ShareRoot>> {
@@ -305,6 +315,7 @@ pub fn load() -> Settings {
                 s.confirm_connections = v == "1" || v.eq_ignore_ascii_case("true")
             }
             "allow_cidrs" => s.allow_cidrs = v.to_string(),
+            "view_only" => s.view_only = v == "1" || v.eq_ignore_ascii_case("true"),
             "keep_awake" => s.keep_awake = v == "1" || v.eq_ignore_ascii_case("true"),
             "allow_debug" => s.allow_debug = v == "1" || v.eq_ignore_ascii_case("true"),
             "title" => s.title = v.to_string(),
@@ -357,12 +368,13 @@ pub fn save(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nconfirm_connections={}\nallow_cidrs={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nshare_files={}\nshare_dir={}\ntls={}\ntls_cert={}\ntls_key={}\nurl={}\n",
+        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nconfirm_connections={}\nallow_cidrs={}\nview_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nshare_files={}\nshare_dir={}\ntls={}\ntls_cert={}\ntls_key={}\nurl={}\n",
         s.port,
         s.color_level,
         s.loopback_only as u8,
         s.confirm_connections as u8,
         s.allow_cidrs,
+        s.view_only as u8,
         s.keep_awake as u8,
         s.allow_debug as u8,
         s.password.clone().unwrap_or_default(),
@@ -387,6 +399,7 @@ pub fn apply_live(s: &Settings) {
     let old_loop = LOOPBACK_ONLY.swap(s.loopback_only, Ordering::Relaxed);
     CONFIRM_CONNECTIONS.store(s.confirm_connections, Ordering::Relaxed);
     set_allow_cidrs(&s.allow_cidrs);
+    VIEW_ONLY.store(s.view_only, Ordering::Relaxed);
     KEEP_AWAKE.store(s.keep_awake, Ordering::Relaxed);
     ALLOW_DEBUG.store(s.allow_debug, Ordering::Relaxed);
     SHARE_FILES.store(s.share_files, Ordering::Relaxed);
@@ -420,6 +433,7 @@ pub fn current() -> Settings {
         loopback_only: LOOPBACK_ONLY.load(Ordering::Relaxed),
         confirm_connections: confirm_connections(),
         allow_cidrs: allow_cidrs_raw(),
+        view_only: view_only(),
         keep_awake: KEEP_AWAKE.load(Ordering::Relaxed),
         allow_debug: ALLOW_DEBUG.load(Ordering::Relaxed),
         url: url(),

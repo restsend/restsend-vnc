@@ -72,6 +72,7 @@ fn test_pattern_session_reaches_framebuffer_update() {
             "--port",
             &port.to_string(),
         ])
+        .env("RESTSEND_VNC_ALLOW_MULTIPLE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
