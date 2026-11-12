@@ -8,3 +8,4 @@ pub mod keysym;
 pub mod messages;
 pub mod pixel;
 pub mod security;
+pub mod vencrypt;

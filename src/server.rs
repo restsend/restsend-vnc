@@ -74,12 +74,19 @@ pub fn serve(
         let session_id = register_session(&stream);
         let state = Arc::clone(&state);
         let hub = Arc::clone(&hub);
+        // `--share-dir` overrides the tray setting for this run; otherwise the
+        // live setting is evaluated per connection so toggling it in the tray
+        // applies without restarting.
+        let share_root = cfg
+            .share_root
+            .clone()
+            .or_else(crate::settings::share_root);
         let cfg = SessionConfig {
             name: crate::settings::title(),
             view_only: cfg.view_only,
             test_pattern: cfg.test_pattern,
             input_enabled: cfg.input_enabled,
-            share_root: cfg.share_root.clone(),
+            share_root,
             clipboard_enabled: cfg.clipboard_enabled,
         };
         let password = crate::settings::password();

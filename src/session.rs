@@ -11,8 +11,8 @@
 //! - writer thread: serialises all socket writes from a bounded channel.
 
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::Ordering;
+use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,25 +20,39 @@ use std::time::{Duration, Instant};
 use flate2::Compress;
 
 use crate::clipboard::ClipboardHub;
+use crate::cursor::{
+    cursor_rect, hidden_cursor_message, overlay_frame, pointer_pos_message, rich_cursor_message,
+    CursorSnapshot,
+};
 use crate::diff::{diff_tiles, Rect};
 use crate::encode::{encode_rect, Encoding};
 use crate::framebuffer::{Frame, ScreenState};
+use crate::throttle::{cursor_interval, ByteBudget};
 use crate::input::InputBackend;
 use crate::rfb::filetransfer::{self, ShareRoot, UploadState};
 use crate::rfb::handshake::{self, HandshakeError};
 use crate::rfb::messages::{self, pseudo, rect_header, ClientMessage, UploadPayload};
 use crate::rfb::pixel::{PixelEncoder, PixelFormat};
 
-/// Maximum bytes of pixel data queued per framebuffer update. Large
-/// full-screen changes (video) are split across several ticks so one update
-/// can never stall the stream for long (latency > throughput).
-const MAX_UPDATE_BYTES: usize = 1 << 20;
+/// Hard cap on the wire bytes of one framebuffer update. The time budget
+/// below is the primary limiter; this only prevents pathological messages.
+const MAX_UPDATE_BYTES: usize = 2 << 20;
+/// Bytes allowed to be queued/in flight before the pusher stops encoding.
+/// Keeping roughly one 4K update in flight bounds latency without starving
+/// the link. Larger than one max update so a burst can drain.
+const FRAME_QUEUE_LIMIT: usize = (MAX_UPDATE_BYTES / 4) * 5;
+/// Upper bound on the wall-clock budget for encoding one incremental update.
+/// The actual value follows the frame interval (see `send_update`).
+const MAX_UPDATE_BUDGET: Duration = Duration::from_millis(25);
 /// Cap on the raw bytes of a single rect. Large dirty areas (window drag,
 /// video) are encoded as horizontal strips so one encode never blocks the
 /// stream for hundreds of milliseconds.
-const MAX_RECT_RAW: usize = 512 << 10;
+const MAX_RECT_RAW: usize = 2 << 20;
 const DOWNLOAD_CHUNK: usize = 8192;
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound the RFB/TLS handshake so a slow or silent client cannot pin a
+/// session thread forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a session waits for the first captured frame (viewer connect
 /// timeouts are typically ~30s; keep well below).
 const FIRST_FRAME_WAIT: Duration = Duration::from_secs(10);
@@ -57,14 +71,16 @@ pub struct SessionConfig {
 
 /// Session writer channel message.
 enum OutMsg {
-    /// Pre-serialized wire bytes (plaintext or encrypted, depending on state).
+    /// Pre-serialized control bytes (clipboard, file transfer, pseudo-rects).
     Data(Vec<u8>),
+    /// A framebuffer update, counted against the byte budget until written.
+    Frame(Vec<u8>),
     /// Switch the Apple 3.889 writer to the encrypted frame channel.
     Activate(crate::rfb::apple_auth::AppleStreamCipher),
 }
 
 pub fn handle_client(
-    stream: TcpStream,
+    mut stream: TcpStream,
     peer: SocketAddr,
     state: Arc<ScreenState>,
     password: Option<String>,
@@ -76,19 +92,29 @@ pub fn handle_client(
     // links where the default (64K) throttles the window.
     let sock = socket2::SockRef::from(&stream);
     let _ = sock.set_send_buffer_size(1 << 20);
+    // Kept until the session ends so a writer blocked in write_all() (or a
+    // TLS pump blocked in poll) can be woken up; otherwise the threads and
+    // the cached framebuffer leak after every disconnect.
+    let shutdown_sock = stream.try_clone().ok();
     let trace_path = std::env::var("RESTSEND_VNC_TRACE_INBOUND").ok();
 
-    // --- handshake (needs both directions) ---
-    let mut reader_stream = stream.try_clone()?;
-    let session_reader_stream = reader_stream.try_clone()?;
-    let mut reader = std::io::BufReader::new(&mut reader_stream);
-    let mut writer_stream = stream;
-
-    let hs = match handshake::perform(
-        &mut reader,
-        &mut writer_stream,
+    // --- handshake (single duplex stream; VeNCrypt upgrades it to TLS) ---
+    // No BufReader here: a client may pipeline its TLS ClientHello right
+    // behind the VeNCrypt sub-type choice, and buffered bytes must not be
+    // lost when the transport is replaced.
+    let _ = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT));
+    let tls_mode = crate::settings::tls_mode();
+    let tls_config = if tls_mode == crate::tls::Mode::Off {
+        None
+    } else {
+        crate::tls::server_config()
+    };
+    let mut hs = match handshake::perform(
+        &mut stream,
         password.as_deref(),
         cfg.share_root.is_some() && !cfg.view_only,
+        tls_mode,
+        tls_config,
     ) {
         Ok(hs) => hs,
         // Port scans / Bonjour probes open and close without speaking RFB.
@@ -101,25 +127,31 @@ pub fn handle_client(
             return Ok(());
         }
     };
+    let _ = stream.set_read_timeout(None);
+
+    // --- transport: plain socket halves or TLS pump ---
+    let crate::transport::Io {
+        reader,
+        writer: mut writer_stream,
+        pump,
+    } = if let Some(conn) = hs.tls.take() {
+        crate::transport::tls(conn, stream)?
+    } else {
+        crate::transport::plain(stream)?
+    };
+    let mut reader = reader;
+
     state.set_peer(peer.to_string());
-    let client_info = format!(
-        "RFB3.{:02} {}{}",
-        hs.minor,
-        match hs.auth {
-            crate::rfb::handshake::AuthMethod::None => "NONE",
-            crate::rfb::handshake::AuthMethod::VncAuth => "VNC-AUTH",
-            crate::rfb::handshake::AuthMethod::AppleDh => "APPLE-DH",
-        },
-        if hs.tight { " TIGHT" } else { "" }
-    );
+    let client_info = describe_client(&hs);
     state.set_client_info(client_info.clone());
     crate::audit::log("connect", &peer, &client_info, None);
     let session_started = Instant::now();
     tracing::info!(
-        "handshake from {peer}: rfb 3.{:02}, security type {}, auth={:?}, tight={}",
+        "handshake from {peer}: rfb 3.{:02}, security type {}, auth={:?} ({}), tight={}",
         hs.minor,
         hs.security_type,
         hs.auth,
+        if hs.encrypted { "encrypted" } else { "plaintext" },
         hs.tight
     );
 
@@ -187,7 +219,7 @@ pub fn handle_client(
 
     // --- Tight interaction caps (advertises file-transfer extensions) ---
     if hs.tight {
-        send_interaction_caps(&mut writer_stream, cfg.share_root.is_some() && !cfg.view_only)?;
+        send_interaction_caps(writer_stream.as_mut(), cfg.share_root.is_some() && !cfg.view_only)?;
     }
 
     // --- ARD encrypted frame channel (experimental, extended-init clients) ---
@@ -218,13 +250,16 @@ pub fn handle_client(
     }
 
     // --- writer thread ---
-    let (tx, rx) = std::sync::mpsc::sync_channel::<OutMsg>(256);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<OutMsg>(64);
     let queue_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let frame_budget = Arc::new(ByteBudget::new(FRAME_QUEUE_LIMIT));
+    let session_stop = Arc::new(AtomicBool::new(false));
     let writer_thread = std::thread::Builder::new()
         .name("restsend-vnc-session-writer".into())
         .spawn({
             let depth = Arc::clone(&queue_depth);
-            move || writer_loop(writer_stream, rx, depth)
+            let budget = Arc::clone(&frame_budget);
+            move || writer_loop(writer_stream, rx, depth, budget)
         })
         .expect("spawn session writer");
 
@@ -237,6 +272,8 @@ pub fn handle_client(
     let enc: Arc<Mutex<EncState>> = Arc::new(Mutex::new(EncState {
         encodings: Vec::new(),
         encoder: PixelEncoder::new(pf),
+        cursor_rich: false,
+        cursor_pos: false,
     }));
     // Every client is server-push fed: the pusher thread publishes
     // incremental updates at the configured fps. (Apple 3.889 clients send
@@ -245,6 +282,8 @@ pub fn handle_client(
         tx: tx.clone(),
         state: Arc::clone(&state),
         enc: Arc::clone(&enc),
+        frame_budget: Arc::clone(&frame_budget),
+        stop: Arc::clone(&session_stop),
         client_ready: Arc::clone(&client_ready),
         cached: Arc::new(Frame::new(0, 0)),
         client_dims: (w as u32, h as u32),
@@ -260,11 +299,19 @@ pub fn handle_client(
         dropped: 0,
         queue_depth: Arc::clone(&queue_depth),
         frame_interval: Duration::from_millis(1000 / state.max_fps.max(1) as u64),
+
         force_next: false,
         pending: Vec::new(),
+        last_frame_gen: u64::MAX,
+        cursor_shape_serial_sent: 0,
+        cursor_pos_sent: (u16::MAX, u16::MAX),
+        cursor_visible_sent: false,
+        cursor_gen_sent: u64::MAX,
+        cursor_bbox_sent: None,
+        cursor_need_repaint: false,
         fbur_seen: 0,
     };
-    std::thread::Builder::new()
+    let updater_thread = std::thread::Builder::new()
         .name("restsend-vnc-session-pusher".into())
         .spawn(move || updater.run())
         .expect("spawn session pusher");
@@ -303,7 +350,6 @@ pub fn handle_client(
         tx,
         queue_depth: Arc::clone(&queue_depth),
         session_id,
-        reader_stream: session_reader_stream,
         apple_key: hs.apple_key,
         apple_seq: Arc::new(std::sync::atomic::AtomicU32::new(
             std::env::var("RESTSEND_VNC_APPLE_SEQ")
@@ -336,10 +382,14 @@ pub fn handle_client(
     // still unencrypted; we do the same shortly after startup.
     if session.apple_key.is_some() && std::env::var_os("RESTSEND_VNC_APPLE_NO_INFO").is_none() {
         let tx = session.tx.clone();
+        let stop = Arc::clone(&session_stop);
         std::thread::Builder::new()
             .name("restsend-vnc-apple-info".into())
             .spawn(move || {
                 std::thread::sleep(Duration::from_secs(1));
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
                 let payload = crate::rfb::apple_auth::auto_pasteboard_info(2);
                 let _ = tx.try_send(OutMsg::Data(payload.to_vec()));
             })
@@ -371,16 +421,39 @@ pub fn handle_client(
         &format!("{client_info} reason={reason}"),
         Some(duration),
     );
+    // Tear the session down deterministically. Without this the pusher keeps
+    // its 4K `cached` frame and the writer blocks in recv() forever after a
+    // static-screen disconnect (one leaked thread set + ~33 MB per viewer).
+    session_stop.store(true, Ordering::Relaxed);
+    if let Some(sock) = &shutdown_sock {
+        let _ = sock.shutdown(Shutdown::Both);
+    }
     session.hub.unregister(session.session_id);
     session.state.clear_session();
-    drop(session.tx); // closes channel -> writer exits
+    drop(session.tx);
+    let _ = updater_thread.join();
     let _ = writer_thread.join();
+    if let Some(pump) = pump {
+        let _ = pump.join();
+    }
 
     match result {
         Ok(()) => tracing::info!("session ended: {peer}"),
         Err(e) => tracing::info!("session ended: {peer} ({e})"),
     }
     Ok(())
+}
+
+/// One-line client description used by the audit log and the debug overlay's
+/// `CLI` line. Always ends in `[TLS]` or `[PLAIN]` so the link encryption is
+/// visible at a glance.
+fn describe_client(hs: &handshake::HandshakeResult) -> String {
+    let mut info = format!("RFB3.{:02} {}", hs.minor, hs.auth.label());
+    if hs.tight {
+        info.push_str(" TIGHT");
+    }
+    info.push_str(if hs.encrypted { " [TLS]" } else { " [PLAIN]" });
+    info
 }
 
 /// macOS Screen Sharing maps Command to Alt_L and Option to Meta_L on the
@@ -398,25 +471,53 @@ fn apple_keysym_target(keysym: u32) -> u32 {
 }
 
 fn writer_loop(
-    mut stream: TcpStream,
+    mut stream: Box<dyn Write + Send>,
     rx: std::sync::mpsc::Receiver<OutMsg>,
     depth: Arc<std::sync::atomic::AtomicUsize>,
+    budget: Arc<ByteBudget>,
 ) {
     let mut cipher: Option<crate::rfb::apple_auth::AppleStreamCipher> = None;
-    while let Ok(msg) = rx.recv() {
-        let ok = match msg {
+    while let Ok(msg) = rx.recv() {        let ok = match msg {
             OutMsg::Activate(c) => {
                 cipher = Some(c);
                 true
             }
+            OutMsg::Frame(data) => {
+                tracing::trace!(
+                    "writer: frame {} bytes head={:02x?}",
+                    data.len(),
+                    &data[..data.len().min(16)]
+                );
+                let _ = depth.fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |v| Some(v.saturating_sub(1)),
+                );
+                let len = data.len();
+                let ok = match cipher.as_mut() {
+                    None => stream.write_all(&data).is_ok(),
+                    Some(c) => data
+                        .chunks(0x8000)
+                        .all(|chunk| stream.write_all(&c.seal(chunk)).is_ok()),
+                };
+                // The bytes are out of our hands (or the connection died);
+                // either way the pusher may encode again.
+                budget.release(len);
+                ok
+            }
             OutMsg::Data(data) => {
+                tracing::trace!(
+                    "writer: data {} bytes head={:02x?}",
+                    data.len(),
+                    &data[..data.len().min(16)]
+                );
                 let _ = depth.fetch_update(
                     std::sync::atomic::Ordering::Relaxed,
                     std::sync::atomic::Ordering::Relaxed,
                     |v| Some(v.saturating_sub(1)),
                 );
                 match cipher.as_mut() {
-                None => stream.write_all(&data).is_ok(),
+                    None => stream.write_all(&data).is_ok(),
                     Some(c) => data
                         .chunks(0x8000)
                         .all(|chunk| stream.write_all(&c.seal(chunk)).is_ok()),
@@ -432,7 +533,7 @@ fn writer_loop(
 
 /// Tight protocol interaction capabilities sent right after ServerInit.
 /// Without these, Tight-family viewers keep the file-transfer UI disabled.
-fn send_interaction_caps(stream: &mut TcpStream, ft_enabled: bool) -> std::io::Result<()> {
+fn send_interaction_caps(stream: &mut dyn Write, ft_enabled: bool) -> std::io::Result<()> {
     const TGHT: &[u8; 4] = b"TGHT";
     const STDV: &[u8; 4] = b"STDV";
     fn cap(code: i32, vendor: &[u8; 4], name: &[u8; 8]) -> Vec<u8> {
@@ -510,6 +611,10 @@ impl<R: std::io::Read> std::io::Read for TeeReader<'_, R> {
 struct EncState {
     encodings: Vec<i32>,
     encoder: PixelEncoder,
+    /// Client advertised the Rich Cursor pseudo-encoding (-239).
+    cursor_rich: bool,
+    /// Client advertised the PointerPos pseudo-encoding (-232).
+    cursor_pos: bool,
 }
 
 /// Pusher thread state: owns the framebuffer-update machinery.
@@ -517,6 +622,11 @@ struct Updater {
     tx: SyncSender<OutMsg>,
     state: Arc<ScreenState>,
     enc: Arc<Mutex<EncState>>,
+    frame_budget: Arc<ByteBudget>,
+    /// Set by `handle_client` when the reader is done, so the pusher does not
+    /// keep a 4K `cached` frame alive forever after a static-screen
+    /// disconnect.
+    stop: Arc<AtomicBool>,
     /// Set once the client sends its first post-init message; pushing before
     /// that would interleave framebuffer data with the client's own init.
     client_ready: Arc<std::sync::atomic::AtomicBool>,
@@ -534,11 +644,25 @@ struct Updater {
     stats_encode_ns: u64,
     dropped: u64,
     queue_depth: Arc<std::sync::atomic::AtomicUsize>,
+    /// Base frame interval (from --fps). Updates never run faster than this;
+    /// when encoding takes longer the loop naturally slows down instead of
+    /// adding an artificial backoff (which made 4K drags paint in bands).
     frame_interval: Duration,
-    /// True when the previous update had to defer rects (byte cap).
+    /// True when the previous update had to defer rects (time/byte cap).
     force_next: bool,
-    /// Rects deferred by the byte cap, sent first on the next tick.
+    /// Rects deferred by the time budget, sent first on the next tick.
     pending: Vec<Rect>,
+    /// Last frame generation we pushed.
+    last_frame_gen: u64,
+    /// Cursor state last acknowledged by the client.
+    cursor_shape_serial_sent: u64,
+    cursor_pos_sent: (u16, u16),
+    cursor_visible_sent: bool,
+    cursor_gen_sent: u64,
+    /// Cursor bbox currently drawn by a compositing (non-pseudo) client.
+    cursor_bbox_sent: Option<Rect>,
+    /// A frame update overlapped the cursor; repaint it.
+    cursor_need_repaint: bool,
     /// FBUR counter (diagnostics for the Apple FBUR-driven path).
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub fbur_seen: u64,
@@ -588,6 +712,7 @@ impl Updater {
             if (self.client_ready.load(Ordering::Relaxed) && encodings_known)
                 || ready_at.elapsed() > FIRST_FRAME_WAIT * 2
                 || self.state.is_stopped()
+                || self.stop.load(Ordering::Relaxed)
             {
                 break;
             }
@@ -597,20 +722,19 @@ impl Updater {
             tracing::debug!("pusher: starting, encodings negotiated");
         }
         let mut first = true;
-        let mut last_pushed_gen = u64::MAX;
         loop {
-            if self.state.is_stopped() {
+            if self.state.is_stopped() || self.stop.load(Ordering::Relaxed) {
                 return;
             }
-            let last_generation = self.state.generation();
+            let frame_gen = self.state.generation();
+            let cursor_gen = self.state.cursor_generation();
             let started = Instant::now();
-            // Skip the whole diff/encode pass when the capture thread has not
-            // produced a new frame (the common case for a static desktop).
-            let behind = self.queue_depth.load(Ordering::Relaxed) > 8;
-            if !first && behind {
-                // Client/link is behind: skip this encode, but do NOT mark the
-                // generation as pushed — the dirty frame is retried next tick.
-            } else if first || self.force_next || last_generation != last_pushed_gen {
+            let frame_dirty = first || self.force_next || frame_gen != self.last_frame_gen;
+            let cursor_snapshot = self.state.cursor_snapshot();
+            let cursor_dirty = cursor_snapshot.generation != self.cursor_gen_sent;
+            let cursor_only = !frame_dirty && (cursor_dirty || self.cursor_need_repaint);
+
+            if frame_dirty && self.frame_budget.has_capacity() {
                 let incremental = !first && self.cached.dims() == {
                     let snap = self.state.snapshot();
                     snap.dims()
@@ -622,17 +746,45 @@ impl Updater {
                     std::thread::sleep(Duration::from_millis(200));
                     continue;
                 }
-                let complete =
-                    self.send_update(incremental, Rect::new(0, 0, u16::MAX, u16::MAX))
-                        .unwrap_or(false);
-                let enc_ns = t0.elapsed().as_nanos() as u64;
-                self.dbg_encode_ns += enc_ns;
-                self.stats_encode_ns += enc_ns;
-                self.force_next = !complete;
-                self.force_next |= !self.pending.is_empty();
-                last_pushed_gen = last_generation;
+                match self.send_update(incremental, Rect::new(0, 0, u16::MAX, u16::MAX)) {
+                    Ok(status) => {
+                        let cost = t0.elapsed();
+                        let enc_ns = cost.as_nanos() as u64;
+                        self.dbg_encode_ns += enc_ns;
+                        self.stats_encode_ns += enc_ns;
+                        self.force_next = !self.pending.is_empty();
+                        match status {
+                            UpdateStatus::Sent => {
+                                self.last_frame_gen = frame_gen;
+                                // Any new pixels may have painted over the
+                                // software cursor; repaint it right after.
+                                self.cursor_need_repaint = true;
+                            }
+                            UpdateStatus::Empty => self.last_frame_gen = frame_gen,
+                            UpdateStatus::Skipped => self.dropped += 1,
+                        }
+                    }
+                    Err(e) => {
+                        tracing::info!("pusher ended: {e}");
+                        return;
+                    }
+                }
             }
             first = false;
+
+            if (cursor_dirty || self.cursor_need_repaint) && self.frame_budget.has_capacity() {
+                match self.send_cursor(&cursor_snapshot) {
+                    Ok(true) => {
+                        self.cursor_gen_sent = cursor_snapshot.generation;
+                        self.cursor_need_repaint = false;
+                    }
+                    Ok(false) => {} // out of budget: retry next tick
+                    Err(e) => {
+                        tracing::info!("pusher ended: {e}");
+                        return;
+                    }
+                }
+            }
 
             if self.dbg_at.elapsed() >= Duration::from_secs(1) {
                 let secs = self.dbg_at.elapsed().as_secs_f32().max(1e-3);
@@ -667,18 +819,28 @@ impl Updater {
                 self.stats_at = Instant::now();
             }
 
+            let interval = if cursor_only {
+                // Pointer updates carry a few hundred bytes; let them run at
+                // up to 60 Hz even when the configured capture rate is 30.
+                cursor_interval(self.frame_interval)
+            } else {
+                self.frame_interval
+            };
             let elapsed = started.elapsed();
-            if elapsed < self.frame_interval {
-                // Responsiveness: wake up as soon as the capture thread has a
-                // newer frame instead of sleeping the whole frame interval.
-                // The --fps value still caps the update rate.
-                let wait = self.frame_interval - elapsed;
+            if elapsed < interval {
+                // Responsiveness: wake up as soon as the capture thread or the
+                // cursor poller has a newer state instead of sleeping the
+                // whole interval.
+                let wait = interval - elapsed;
                 let mut waited = Duration::ZERO;
                 while waited < wait {
                     let step = Duration::from_millis(2).min(wait - waited);
                     std::thread::sleep(step);
                     waited += step;
-                    if self.state.generation() != last_generation {
+                    if self.stop.load(Ordering::Relaxed)
+                        || self.state.generation() != frame_gen
+                        || self.state.cursor_generation() != cursor_gen
+                    {
                         break;
                     }
                 }
@@ -717,35 +879,67 @@ impl Updater {
         }
     }
 
-    /// Non-blocking send used by the frame pusher: a full queue means the
-    /// client is behind, so the frame is dropped rather than blocking.
-    fn send_drop(&mut self, msg: Vec<u8>) -> std::io::Result<()> {
-        match self.tx.try_send(OutMsg::Data(msg)) {
-            Ok(()) => {
-                self.queue_depth.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+    /// Queues an already-encoded update. `reserved` bytes were taken from the
+    /// budget *before* encoding: ZRLE uses one continuous zlib stream, so an
+    /// encoded update can never be dropped without corrupting every following
+    /// rect. If the channel is momentarily full we wait for the writer.
+    fn queue_reserved(&mut self, msg: Vec<u8>, reserved: usize) -> std::io::Result<()> {
+        let len = msg.len();
+        let deadline = Instant::now() + SEND_TIMEOUT;
+        let mut slot = Some(OutMsg::Frame(msg));
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                self.frame_budget.release(reserved);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "session ended",
+                ));
             }
-            Err(TrySendError::Full(_)) => {
-                self.dropped += 1;
-                Ok(())
+            match self.tx.try_send(slot.take().expect("send slot occupied")) {
+                Ok(()) => {
+                    self.queue_depth.fetch_add(1, Ordering::Relaxed);
+                    self.frame_budget
+                        .release(reserved.saturating_sub(len));
+                    return Ok(());
+                }
+                Err(TrySendError::Full(m)) => {
+                    if Instant::now() >= deadline {
+                        self.frame_budget.release(reserved);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "client is not consuming updates",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    slot = Some(m);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.frame_budget.release(reserved);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "writer closed",
+                    ));
+                }
             }
-            Err(TrySendError::Disconnected(_)) => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "writer closed",
-            )),
         }
     }
 
-    fn send_update(&mut self, incremental: bool, region: Rect) -> std::io::Result<bool> {
+    fn send_update(&mut self, incremental: bool, region: Rect) -> std::io::Result<UpdateStatus> {
+        // Reserve the worst-case update size before touching the zlib stream.
+        let reserved = MAX_UPDATE_BYTES + (64 << 10);
+        if !self.frame_budget.try_reserve(reserved) {
+            return Ok(UpdateStatus::Skipped);
+        }
         let current = self.state.snapshot();
         if current.dims() == (0, 0) {
             let _ = self.send(messages::framebuffer_update_header(0));
-            return Ok(true);
+            self.frame_budget.release(reserved);
+            return Ok(UpdateStatus::Empty);
         }
 
         // Resolution changed since the client last saw the framebuffer?
         if current.dims() != self.client_dims {
-            let (encodings, _) = self.enc_state();
+            let (encodings, _, _, _) = self.enc_state();
             if encodings.contains(&pseudo::NEW_FB_SIZE) {
                 let mut msg = messages::framebuffer_update_header(1);
                 msg.extend(rect_header(
@@ -759,12 +953,17 @@ impl Updater {
                 self.cached = Arc::clone(&current);
                 tracing::debug!("sent NewFBSize {}x{}", current.width, current.height);
                 let _ = self.send(msg);
-                return Ok(true);
+                // Rects and the cursor overlay belong to the old geometry.
+                self.pending.clear();
+                self.cursor_bbox_sent = None;
+                self.cursor_gen_sent = u64::MAX;
+                self.frame_budget.release(reserved);
+                return Ok(UpdateStatus::Empty);
             }
             // Clients without resize support just get the new-size pixels.
         }
 
-        let (encodings, encoder) = self.enc_state();
+        let (encodings, encoder, _, _) = self.enc_state();
         let encoding = encoding_override().unwrap_or_else(|| Encoding::pick(&encodings));
         // Deferred rects from the previous tick take priority: otherwise a
         // continuously changing screen would always re-send the top and never
@@ -798,26 +997,45 @@ impl Updater {
         }
         rects = expanded;
 
-        // Encode rects under a per-update byte cap; leftovers are restored
-        // into the cached frame so the next push re-diffs them.
+        // Encode rects under a wall-clock budget. This bounds the latency of
+        // one update even when a full-screen change compresses very well (the
+        // old 1 MB cap could take a second to drain 4K top-to-bottom).
+        // The very first paint (and a resolution change) has no interactive
+        // latency to protect, so allow it to finish in fewer ticks.
+        let budget = if incremental {
+            // Leave headroom for the cursor overlay and the next tick, but
+            // let a 30 fps session spend ~23 ms encoding so window drags
+            // complete in one or two updates instead of many thin bands.
+            self.frame_interval
+                .mul_f32(0.7)
+                .clamp(Duration::from_millis(8), MAX_UPDATE_BUDGET)
+        } else {
+            Duration::from_millis(150)
+        };
+        let encode_started = Instant::now();
         let mut payloads: Vec<Vec<u8>> = Vec::new();
         let mut total: usize = 0;
         let mut unsent: Vec<Rect> = Vec::new();
         for rect in rects.drain(..) {
             let estimate = rect.w as usize * rect.h as usize * encoder.bytes_per_pixel();
-            if !payloads.is_empty() && total + estimate > MAX_UPDATE_BYTES {
+            if !payloads.is_empty()
+                && (encode_started.elapsed() >= budget || total + estimate > MAX_UPDATE_BYTES)
+            {
                 unsent.push(rect);
                 continue;
             }
             let mut payload = rect_header(rect.x, rect.y, rect.w, rect.h, encoding.code());
-            encode_rect(
+            if let Err(e) = encode_rect(
                 &mut payload,
                 &current,
                 rect,
                 encoding,
                 &encoder,
                 &mut self.zrle,
-            )?;
+            ) {
+                self.frame_budget.release(reserved);
+                return Err(e);
+            }
             total += payload.len();
             payloads.push(payload);
         }
@@ -825,33 +1043,199 @@ impl Updater {
         let nrects = payloads.len();
         if nrects == 0 {
             // Nothing changed: don't burn a wakeup on an empty update.
-            return Ok(true);
+            self.frame_budget.release(reserved);
+            return Ok(UpdateStatus::Empty);
         }
         let mut msg = messages::framebuffer_update_header(nrects as u16);
         for p in payloads {
             msg.extend_from_slice(&p);
         }
         let msg_bytes = msg.len();
-        // Real-time path: drop the frame if the writer is still busy instead
-        // of stalling the capture/push loop (stutter).
-        self.send_drop(msg)?;
+        self.queue_reserved(msg, reserved)?;
 
-        // The shared cached frame is always the latest capture; deferred rects
-        // are tracked explicitly in `pending`, so no full-frame clone is
-        // needed here.
         self.pending = unsent;
         self.cached = Arc::clone(&current);
+        if !self.pending.is_empty() {
+            tracing::trace!("deferred {} rect(s) to the next update", self.pending.len());
+        }
         self.stats_updates += 1;
         self.stats_bytes += msg_bytes as u64;
         self.dbg_updates += 1;
         self.dbg_bytes += msg_bytes as u64;
-        Ok(self.pending.is_empty())
+        Ok(UpdateStatus::Sent)
     }
 
-    fn enc_state(&self) -> (Vec<i32>, PixelEncoder) {
+    fn enc_state(&self) -> (Vec<i32>, PixelEncoder, bool, bool) {
         let st = self.enc.lock().unwrap();
-        (st.encodings.clone(), st.encoder.clone())
+        (
+            st.encodings.clone(),
+            st.encoder.clone(),
+            st.cursor_rich,
+            st.cursor_pos,
+        )
     }
+
+    /// Sends cursor shape/position pseudo-rects (client-side cursor) or a
+    /// tiny composited overlay rectangle (all other clients). Returns false
+    /// when the send budget is exhausted and the update should be retried.
+    fn send_cursor(&mut self, snap: &CursorSnapshot) -> std::io::Result<bool> {
+        let (encodings, encoder, rich, pos_supported) = self.enc_state();
+        if encodings.is_empty() {
+            return Ok(true);
+        }
+        let scale = self.state.scale();
+
+        if rich {
+            let mut queued = false;
+            let hidden = !snap.visible || snap.shape.is_none();
+            if hidden != !self.cursor_visible_sent
+                || snap.shape_serial != self.cursor_shape_serial_sent
+            {
+                let (msg, estimate) = match (snap.visible, snap.shape.as_ref()) {
+                    (true, Some(shape)) => {
+                        let scaled = shape.scaled(scale);
+                        let w = scaled.width as usize;
+                        let h = scaled.height as usize;
+                        let estimate =
+                            16 + w * h * encoder.bytes_per_pixel() + ((w + 7) / 8) * h;
+                        (rich_cursor_message(&scaled, &encoder), estimate)
+                    }
+                    _ => (hidden_cursor_message(), 16),
+                };
+                if !self.frame_budget.try_reserve(estimate) {
+                    return Ok(false);
+                }
+                self.queue_reserved(msg, estimate)?;
+                self.cursor_shape_serial_sent = snap.shape_serial;
+                self.cursor_visible_sent = snap.visible;
+                self.stats_updates += 1;
+                self.dbg_updates += 1;
+                self.dbg_bytes += estimate as u64;
+                queued = true;
+            }
+            if pos_supported && (snap.x, snap.y) != self.cursor_pos_sent {
+                if !self.frame_budget.try_reserve(16) {
+                    return Ok(false);
+                }
+                self.queue_reserved(pointer_pos_message(snap.x, snap.y), 16)?;
+                self.cursor_pos_sent = (snap.x, snap.y);
+                self.stats_updates += 1;
+                self.dbg_updates += 1;
+                self.dbg_bytes += 16;
+                queued = true;
+            }
+            if !queued {
+                // Nothing to send; still count the state as acknowledged.
+                self.cursor_pos_sent = (snap.x, snap.y);
+            }
+            return Ok(true);
+        }
+
+        // Composited cursor: paint the sprite into a tiny rectangle. Use the
+        // last frame the client actually has (not a newer capture) so the
+        // overlay never leaks pixels the viewer has not received yet.
+        let frame = Arc::clone(&self.cached);
+        if frame.dims() == (0, 0) {
+            // Retry after the first frame arrives; do not acknowledge the
+            // cursor generation yet or the pointer would never be drawn.
+            return Ok(false);
+        }
+        let cur_rect = if snap.visible {
+            snap.shape.as_ref().and_then(|shape| {
+                cursor_rect(shape, snap.x, snap.y, scale, frame.width, frame.height)
+            })
+        } else {
+            None
+        };
+        if cur_rect == self.cursor_bbox_sent
+            && snap.generation == self.cursor_gen_sent
+            && !self.cursor_need_repaint
+        {
+            return Ok(true);
+        }
+
+        let mut paint: Vec<(Rect, bool)> = Vec::new();
+        if let Some(old) = self.cursor_bbox_sent {
+            if Some(old) != cur_rect {
+                paint.push((old, false));
+            }
+        }
+        if let Some(cur) = cur_rect {
+            paint.push((cur, true));
+        }
+        if paint.is_empty() {
+            self.cursor_bbox_sent = None;
+            return Ok(true);
+        }
+
+        let encoding = encoding_override().unwrap_or_else(|| Encoding::pick(&encodings));
+        // Upper bound for the ZRLE/Raw payloads, reserved before encoding so
+        // the shared zlib stream can never be left ahead of the wire.
+        let estimate: usize = paint
+            .iter()
+            .map(|(r, _)| 12 + r.w as usize * r.h as usize * encoder.bytes_per_pixel() + 256)
+            .sum();
+        if !self.frame_budget.try_reserve(estimate) {
+            return Ok(false);
+        }
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(paint.len());
+        for (rect, draw_cursor) in paint {
+            let rect = match rect.clamp(frame.width, frame.height) {
+                Some(r) => r,
+                None => continue,
+            };
+            let tile = if draw_cursor {
+                overlay_frame(&frame, rect, snap, scale)
+            } else {
+                frame.subframe(
+                    rect.x as u32,
+                    rect.y as u32,
+                    rect.w as u32,
+                    rect.h as u32,
+                )
+            };
+            let mut payload = rect_header(rect.x, rect.y, rect.w, rect.h, encoding.code());
+            if let Err(e) = encode_rect(
+                &mut payload,
+                &tile,
+                Rect::new(0, 0, rect.w, rect.h),
+                encoding,
+                &encoder,
+                &mut self.zrle,
+            ) {
+                self.frame_budget.release(estimate);
+                return Err(e);
+            }
+            payloads.push(payload);
+        }
+        if payloads.is_empty() {
+            self.frame_budget.release(estimate);
+            self.cursor_bbox_sent = cur_rect;
+            return Ok(true);
+        }
+        let mut msg = messages::framebuffer_update_header(payloads.len() as u16);
+        for p in payloads {
+            msg.extend_from_slice(&p);
+        }
+        let bytes = msg.len();
+        self.queue_reserved(msg, estimate)?;
+        self.cursor_bbox_sent = cur_rect;
+        self.stats_updates += 1;
+        self.stats_bytes += bytes as u64;
+        self.dbg_updates += 1;
+        self.dbg_bytes += bytes as u64;
+        Ok(true)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateStatus {
+    /// A framebuffer update was queued.
+    Sent,
+    /// There was nothing to send.
+    Empty,
+    /// The writer is at its byte budget; retry next tick.
+    Skipped,
 }
 
 /// Session reader state (thread-local to the reader thread).
@@ -863,9 +1247,6 @@ struct Session {
     queue_depth: Arc<std::sync::atomic::AtomicUsize>,
     #[allow(dead_code)]
     session_id: u64,
-    /// Socket clone used to tweak read timeouts during Apple clipboard drains.
-    #[allow(dead_code)]
-    reader_stream: TcpStream,
     apple_key: Option<[u8; 16]>,
     /// Server->client control-message sequence counter (Apple 3.889 only).
     #[allow(dead_code)]
@@ -896,7 +1277,21 @@ impl Session {
     fn run(&mut self, reader: &mut impl std::io::Read, peer: SocketAddr) -> std::io::Result<()> {
         let ft_enabled = self.cfg.share_root.is_some() && !self.cfg.view_only;
         loop {
-            let msg = messages::read_client_message(reader, ft_enabled)?;
+            let msg = match messages::read_client_message(reader, ft_enabled) {
+                Ok(msg) => msg,
+                // Normal client disconnect (plain TCP reset or TLS EOF).
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    return Ok(())
+                }
+                Err(e) => return Err(e),
+            };
             self.dispatch(msg, peer, reader)?;
         }
     }
@@ -928,7 +1323,34 @@ impl Session {
             }
             ClientMessage::SetEncodings(encodings) => {
                 tracing::debug!("{peer}: encodings -> {:?}", encodings);
-                self.enc.lock().unwrap().encodings = encodings;
+                {
+                    let mut st = self.enc.lock().unwrap();
+                    // Escape hatch for clients that advertise the pseudo-
+                    // encoding but do not actually draw the local cursor.
+                    let force_server =
+                        std::env::var_os("RESTSEND_VNC_CURSOR_SERVER").is_some();
+                    st.cursor_rich =
+                        !force_server && encodings.contains(&pseudo::RICH_CURSOR);
+                    // The viewer already knows where its own pointer is.
+                    // Echoing PointerPos at 60 Hz is redundant and some
+                    // clients repaint badly when it interleaves with frame
+                    // updates, so it is opt-in.
+                    st.cursor_pos = encodings.contains(&pseudo::POINTER_POS)
+                        && std::env::var_os("RESTSEND_VNC_POINTER_POS").is_some();
+                    st.encodings = encodings;
+                }
+                let (rich, pos) = {
+                    let st = self.enc.lock().unwrap();
+                    (st.cursor_rich, st.cursor_pos)
+                };
+                let mode = if rich { "client" } else { "composited" };
+                self.state.set_cursor_mode(mode);
+                tracing::info!(
+                    "{peer}: cursor mode = {} (rich={} pointer-pos={})",
+                    mode,
+                    rich,
+                    pos
+                );
                 // ARD encrypted frame channel: the setup rect must follow the
                 // client's first SetEncodings; encryption starts right after.
                 if let Some(setup) = self.pending_setup.take() {
@@ -1054,6 +1476,11 @@ impl Session {
     /// Applies a pointer position/button update (shared by standard RFB and
     /// Apple clients). `mask` follows RFB bit order.
     fn apply_pointer(&mut self, x: u16, y: u16, mask: u8) {
+        // Track the pointer in framebuffer coordinates for the composited
+        // cursor. (The WGC frame no longer contains the pointer.)
+        if !self.cfg.test_pattern {
+            self.state.set_cursor_pos(x, y);
+        }
         // Hidden shortcut: hold Ctrl and left-click 3 times (within 2s) to
         // toggle the debug overlay.
         let left_pressed = mask & 1 != 0 && self.last_mask & 1 == 0;
@@ -1319,6 +1746,55 @@ fn apple_button_mask(mask: u8) -> u8 {
 
 
 #[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    fn area(r: &Rect) -> u64 {
+        r.w as u64 * r.h as u64
+    }
+
+    #[test]
+    fn split_rect_respects_cap_and_covers_input() {
+        let mut out = Vec::new();
+        split_rect(&mut out, Rect::new(0, 0, 3840, 2160), 3, MAX_RECT_RAW);
+        assert!(out.len() > 1);
+        assert_eq!(out.iter().map(area).sum::<u64>(), 3840 * 2160);
+        for r in &out {
+            assert_eq!(r.x, 0);
+            assert_eq!(r.w, 3840);
+            assert!(r.w as usize * r.h as usize * 3 <= MAX_RECT_RAW || r.h == 1);
+            assert!(r.h > 0);
+        }
+        // Contiguous, non-overlapping strips.
+        let mut y = 0u16;
+        for r in &out {
+            assert_eq!(r.y, y);
+            y += r.h;
+        }
+        assert_eq!(y, 2160);
+    }
+
+    #[test]
+    fn split_rect_keeps_small_rect_whole() {
+        let mut out = Vec::new();
+        split_rect(&mut out, Rect::new(10, 20, 100, 50), 4, MAX_RECT_RAW);
+        assert_eq!(out, vec![Rect::new(10, 20, 100, 50)]);
+        out.clear();
+        split_rect(&mut out, Rect::new(0, 0, 0, 10), 4, MAX_RECT_RAW);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn contains_rect_is_nesting_not_intersection() {
+        let outer = Rect::new(0, 0, 100, 100);
+        assert!(contains_rect(&outer, &Rect::new(10, 10, 20, 20)));
+        assert!(contains_rect(&outer, &outer));
+        assert!(!contains_rect(&outer, &Rect::new(90, 90, 20, 20)));
+        assert!(!contains_rect(&Rect::new(10, 10, 20, 20), &outer));
+    }
+}
+
+#[cfg(test)]
 mod apple_key_tests {
     use super::apple_keysym_target;
     use crate::rfb::keysym as ks;
@@ -1329,5 +1805,44 @@ mod apple_key_tests {
         assert_eq!(apple_keysym_target(ks::META_L), ks::ALT_L); // Option
         assert_eq!(apple_keysym_target(ks::CONTROL_L), ks::CONTROL_L);
         assert_eq!(apple_keysym_target(0x63), 0x63);
+    }
+}
+
+#[cfg(test)]
+mod client_info_tests {
+    use super::describe_client;
+    use crate::rfb::handshake::{AuthMethod, HandshakeResult};
+
+    fn result(auth: AuthMethod, encrypted: bool) -> HandshakeResult {
+        HandshakeResult {
+            minor: 8,
+            security_type: if encrypted { 19 } else { 2 },
+            tight: false,
+            auth,
+            apple_key: None,
+            client_init: 1,
+            encrypted,
+            tls: None,
+        }
+    }
+
+    #[test]
+    fn debug_overlay_marks_encryption() {
+        assert_eq!(
+            describe_client(&result(AuthMethod::VeNCryptTlsVnc, true)),
+            "RFB3.08 TLS-VNC [TLS]"
+        );
+        assert_eq!(
+            describe_client(&result(AuthMethod::VeNCryptTlsNone, true)),
+            "RFB3.08 TLS-NONE [TLS]"
+        );
+        assert_eq!(
+            describe_client(&result(AuthMethod::VncAuth, false)),
+            "RFB3.08 VNC-AUTH [PLAIN]"
+        );
+        assert_eq!(
+            describe_client(&result(AuthMethod::AppleDh, false)),
+            "RFB3.08 APPLE-DH [PLAIN]"
+        );
     }
 }

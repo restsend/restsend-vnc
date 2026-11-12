@@ -4,9 +4,24 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::rfb::filetransfer::ShareRoot;
+use crate::tls::Mode;
 
 pub const DEFAULT_URL: &str = "https://restsend.com";
+
+/// Default folder offered for file sharing: the current user's home directory.
+pub fn default_share_dir() -> PathBuf {
+    for var in ["USERPROFILE", "HOME"] {
+        if let Some(p) = std::env::var_os(var) {
+            if !p.is_empty() {
+                return PathBuf::from(p);
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -20,6 +35,15 @@ pub struct Settings {
     pub title: String,
     pub autostart: bool,
     pub logon_task: bool,
+    /// File transfer is opt-in; clients can only browse `share_dir`.
+    pub share_files: bool,
+    /// Sandbox root for uploads/downloads (defaults to the user's home).
+    pub share_dir: PathBuf,
+    /// Encryption policy: off / auto (prefer TLS) / required.
+    pub tls: Mode,
+    /// Optional user-provided certificate / key (PEM).
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
 }
 
 impl Default for Settings {
@@ -35,6 +59,11 @@ impl Default for Settings {
             title: "restsend-vnc".to_string(),
             autostart: false,
             logon_task: false,
+            share_files: false,
+            share_dir: default_share_dir(),
+            tls: Mode::Auto,
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -45,6 +74,10 @@ pub static COLOR_LEVEL: AtomicU8 = AtomicU8::new(16);
 pub static LOOPBACK_ONLY: AtomicBool = AtomicBool::new(false);
 pub static KEEP_AWAKE: AtomicBool = AtomicBool::new(true);
 pub static ALLOW_DEBUG: AtomicBool = AtomicBool::new(true);
+/// Encryption policy (0 = off, 1 = auto/prefer TLS, 2 = required).
+pub static TLS_MODE: AtomicU8 = AtomicU8::new(Mode::Auto as u8);
+/// File transfer is off unless the user opts in via the tray settings.
+pub static SHARE_FILES: AtomicBool = AtomicBool::new(false);
 /// Incremented when the listener needs to rebind (port/loopback changed).
 pub static RELOAD: AtomicUsize = AtomicUsize::new(0);
 /// Set by the tray "Exit" item.
@@ -53,6 +86,81 @@ pub static EXIT: AtomicBool = AtomicBool::new(false);
 static URL: OnceLock<Mutex<String>> = OnceLock::new();
 static PASSWORD: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static TITLE: OnceLock<Mutex<String>> = OnceLock::new();
+static SHARE_DIR: OnceLock<Mutex<PathBuf>> = OnceLock::new();
+static TLS_CERT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static TLS_KEY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+pub fn tls_mode() -> Mode {
+    Mode::from_u8(TLS_MODE.load(Ordering::Relaxed))
+}
+
+pub fn set_tls_mode(mode: Mode) {
+    TLS_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+pub fn tls_cert() -> Option<String> {
+    TLS_CERT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+pub fn set_tls_cert(path: Option<String>) {
+    *TLS_CERT.get_or_init(|| Mutex::new(None)).lock().unwrap() = path;
+}
+
+pub fn tls_key() -> Option<String> {
+    TLS_KEY
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+pub fn set_tls_key(path: Option<String>) {
+    *TLS_KEY.get_or_init(|| Mutex::new(None)).lock().unwrap() = path;
+}
+
+fn share_dir_cell() -> &'static Mutex<PathBuf> {
+    SHARE_DIR.get_or_init(|| Mutex::new(default_share_dir()))
+}
+
+pub fn share_dir() -> PathBuf {
+    share_dir_cell().lock().unwrap().clone()
+}
+
+pub fn set_share_dir(dir: &std::path::Path) {
+    let dir = if dir.as_os_str().is_empty() {
+        default_share_dir()
+    } else {
+        dir.to_path_buf()
+    };
+    *share_dir_cell().lock().unwrap() = dir;
+}
+
+pub fn share_files() -> bool {
+    SHARE_FILES.load(Ordering::Relaxed)
+}
+
+/// Resolves the live share root for new connections. `None` means the
+/// TightVNC file-transfer extension stays disabled.
+pub fn share_root() -> Option<Arc<ShareRoot>> {
+    if !share_files() {
+        return None;
+    }
+    let dir = share_dir();
+    match ShareRoot::new(&dir) {
+        Ok(root) => Some(Arc::new(root)),
+        Err(e) => {
+            tracing::warn!(
+                "shared folder {} is not usable ({e}); file transfer is disabled",
+                dir.display()
+            );
+            None
+        }
+    }
+}
 
 pub fn title() -> String {
     TITLE
@@ -133,6 +241,19 @@ pub fn load() -> Settings {
             "title" => s.title = v.to_string(),
             "autostart" => s.autostart = v == "1" || v.eq_ignore_ascii_case("true"),
             "logon_task" => s.logon_task = v == "1" || v.eq_ignore_ascii_case("true"),
+            "share_files" => s.share_files = v == "1" || v.eq_ignore_ascii_case("true"),
+            "share_dir" => {
+                if !v.is_empty() {
+                    s.share_dir = PathBuf::from(v);
+                }
+            }
+            "tls" => {
+                if let Some(mode) = Mode::parse(v) {
+                    s.tls = mode;
+                }
+            }
+            "tls_cert" => s.tls_cert = if v.is_empty() { None } else { Some(v.to_string()) },
+            "tls_key" => s.tls_key = if v.is_empty() { None } else { Some(v.to_string()) },
             "password" => {
                 s.password = if v.is_empty() { None } else { Some(v.to_string()) };
             }
@@ -153,7 +274,7 @@ pub fn save(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nurl={}\n",
+        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nshare_files={}\nshare_dir={}\ntls={}\ntls_cert={}\ntls_key={}\nurl={}\n",
         s.port,
         s.color_level,
         s.loopback_only as u8,
@@ -163,6 +284,11 @@ pub fn save(s: &Settings) {
         s.title,
         s.autostart as u8,
         s.logon_task as u8,
+        s.share_files as u8,
+        s.share_dir.display(),
+        s.tls,
+        s.tls_cert.clone().unwrap_or_default(),
+        s.tls_key.clone().unwrap_or_default(),
         s.url
     );
     if let Ok(mut f) = std::fs::File::create(&path) {
@@ -176,6 +302,11 @@ pub fn apply_live(s: &Settings) {
     let old_loop = LOOPBACK_ONLY.swap(s.loopback_only, Ordering::Relaxed);
     KEEP_AWAKE.store(s.keep_awake, Ordering::Relaxed);
     ALLOW_DEBUG.store(s.allow_debug, Ordering::Relaxed);
+    SHARE_FILES.store(s.share_files, Ordering::Relaxed);
+    set_share_dir(&s.share_dir);
+    set_tls_mode(s.tls);
+    set_tls_cert(s.tls_cert.clone());
+    set_tls_key(s.tls_key.clone());
     set_url(&s.url);
     set_password(s.password.clone());
     set_title(&s.title);
@@ -205,5 +336,22 @@ pub fn current() -> Settings {
         title: title(),
         autostart: crate::autostart::enabled(),
         logon_task: logon_task_flag(),
+        share_files: share_files(),
+        share_dir: share_dir(),
+        tls: tls_mode(),
+        tls_cert: tls_cert(),
+        tls_key: tls_key(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_sharing_is_opt_in() {
+        let s = Settings::default();
+        assert!(!s.share_files);
+        assert!(!s.share_dir.as_os_str().is_empty());
     }
 }

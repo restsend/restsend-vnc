@@ -6,6 +6,7 @@
 mod awake;
 mod clipboard;
 mod config;
+mod cursor;
 mod diff;
 mod encode;
 mod framebuffer;
@@ -16,9 +17,12 @@ mod server;
 mod settings;
 mod autostart;
 mod audit;
+mod tls;
+mod transport;
 #[cfg(target_os = "windows")]
 mod tray;
 mod session;
+mod throttle;
 
 use std::io::IsTerminal;
 use std::net::TcpListener;
@@ -120,16 +124,39 @@ fn main() {
     if cfg.name != "restsend-vnc" {
         effective.title = cfg.name.clone();
     }
+    if let Some(mode) = cfg.tls {
+        effective.tls = mode;
+    }
+    if let Some(path) = &cfg.tls_cert {
+        effective.tls_cert = Some(path.display().to_string());
+    }
+    if let Some(path) = &cfg.tls_key {
+        effective.tls_key = Some(path.display().to_string());
+    }
     settings::apply_live(&effective);
     tracing::info!(
-        "settings: port={} color={} loopback_only={} keep_awake={} allow_debug={} url={}",
+        "settings: port={} color={} loopback_only={} keep_awake={} allow_debug={} tls={} url={}",
         effective.port,
         effective.color_level,
         effective.loopback_only,
         effective.keep_awake,
         effective.allow_debug,
+        effective.tls,
         effective.url
     );
+
+    // Load/generate the TLS certificate before accepting connections so a
+    // required-TLS configuration fails closed instead of silently downgrading.
+    if effective.tls != tls::Mode::Off {
+        let available = tls::server_config().is_some();
+        if !available && effective.tls == tls::Mode::Required {
+            fatal_dialog(
+                "TLS is required but no usable certificate could be loaded.\n\n\
+                 Check the log, or provide --tls-cert and --tls-key.",
+            );
+            std::process::exit(1);
+        }
+    }
     if cfg.password.is_some() {
         settings::set_password(cfg.password.clone());
     }
@@ -151,6 +178,11 @@ fn main() {
         );
     }
 
+    // DPI awareness must be set before WGC/monitor/cursor queries so all of
+    // them report physical pixels.
+    #[cfg(target_os = "windows")]
+    input::windows::enable_dpi_awareness();
+
     // --- screen capture thread ---
     let state = Arc::new(framebuffer::ScreenState::with_options(
         cfg.fps,
@@ -161,6 +193,8 @@ fn main() {
     spawn_sys_sampler(Arc::clone(&state));
     // Encoder reads this when it creates its per-session zlib stream.
     std::env::set_var("RESTSEND_VNC_ZRLE_LEVEL", cfg.zrle_level.to_string());
+    // windows-capture reads this to coalesce frames before the GPU->CPU copy.
+    std::env::set_var("RESTSEND_VNC_CAPTURE_FPS", cfg.fps.max(1).to_string());
     let kind = if cfg.test_pattern {
         screen::ScreenKind::Dummy
     } else {
@@ -169,6 +203,12 @@ fn main() {
     if let Err(e) = screen::spawn(kind, cfg.display, cfg.fps, Arc::clone(&state)) {
         eprintln!("error: {e}");
         std::process::exit(1);
+    }
+    #[cfg(target_os = "windows")]
+    if !cfg.test_pattern {
+        // Watches the system cursor independently of WGC: pointer movement
+        // must not force a full-resolution capture pass.
+        let _ = cursor::spawn_poller(Arc::clone(&state));
     }
     if cfg.test_pattern {
         tracing::info!("serving a synthetic test pattern (--test-pattern)");
@@ -184,6 +224,11 @@ fn main() {
         "vnc auth"
     } else {
         "no auth"
+    };
+    let tls_desc = match effective.tls {
+        tls::Mode::Off => "TLS off",
+        tls::Mode::Auto => "TLS preferred",
+        tls::Mode::Required => "TLS required",
     };
     let session_cfg = session::SessionConfig {
         name: cfg.name.clone(),
@@ -226,7 +271,7 @@ fn main() {
         let flags = [
             ("view-only", cfg.view_only),
             ("clipboard", cfg.clipboard_enabled && !cfg.view_only),
-            ("file-transfer", cfg.share_root.is_some() && !cfg.view_only),
+            ("file-transfer", !cfg.view_only && (cfg.share_root.is_some() || settings::share_files())),
             ("keep-awake", settings::KEEP_AWAKE.load(std::sync::atomic::Ordering::Relaxed)),
         ]
         .into_iter()
@@ -234,7 +279,7 @@ fn main() {
         .collect::<Vec<_>>()
         .join(", ");
         tracing::info!(
-            "listening on {addr} (auth: {auth_desc}{})",
+            "listening on {addr} (auth: {auth_desc}; {tls_desc}{})",
             if flags.is_empty() {
                 String::new()
             } else {

@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Unit and regression tests
+        run: cargo test --all-targets --quiet
+      - name: Clippy (warnings are not fatal while the TLS work lands)
+        run: cargo clippy --all-targets --quiet
+        continue-on-error: true

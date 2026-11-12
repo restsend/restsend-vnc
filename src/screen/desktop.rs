@@ -48,11 +48,19 @@ fn pick_target(display_index: usize) -> io::Result<Target> {
     })
 }
 
-fn build_capturer(display_index: usize, fps: u32) -> io::Result<Capturer> {
+fn build_capturer(
+    display_index: usize,
+    fps: u32,
+    state: &ScreenState,
+) -> io::Result<Capturer> {
     let target = pick_target(display_index)?;
+    remember_display_rect(&target, state);
     let options = Options {
         fps: fps.max(1),
-        show_cursor: true,
+        // The pointer is handled separately (cursor pseudo-encoding or a
+        // server-composited overlay). Burning it into the frame would make
+        // every mouse move trigger a full 4K capture + diff + encode pass.
+        show_cursor: false,
         show_highlight: false,
         output_type: FrameType::BGRAFrame,
         output_resolution: Resolution::Captured, // native pixels * scale factor
@@ -63,6 +71,33 @@ fn build_capturer(display_index: usize, fps: u32) -> io::Result<Capturer> {
     let capturer = Capturer::build(options)
         .map_err(|e| io::Error::other(format!("capturer build failed: {e:?}")))?;
     Ok(capturer)
+}
+
+/// Records the captured monitor's physical rect so the cursor poller can map
+/// `GetCursorPos` into framebuffer coordinates (including `--scale`).
+fn remember_display_rect(target: &Target, state: &ScreenState) {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
+    use windows::Win32::Foundation::RECT;
+    if let Target::Display(display) = target {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            rcMonitor: RECT::default(),
+            rcWork: RECT::default(),
+            dwFlags: 0,
+        };
+        // scap links a different windows-rs version; rebuild the handle in
+        // our own type space (both are raw HMONITOR pointers).
+        let monitor = windows::Win32::Graphics::Gdi::HMONITOR(display.raw_handle.0);
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            let r = info.rcMonitor;
+            state.set_cursor_map(
+                r.left,
+                r.top,
+                (r.right - r.left).max(1) as u32,
+                (r.bottom - r.top).max(1) as u32,
+            );
+        }
+    }
 }
 
 fn run(display_index: usize, fps: u32, state: Arc<ScreenState>) {
@@ -120,7 +155,7 @@ fn capture_session(
     let pump = std::thread::Builder::new()
         .name("restsend-vnc-capture-pump".into())
         .spawn(move || {
-            let mut capturer = match build_capturer(display_index, fps) {
+            let mut capturer = match build_capturer(display_index, fps, &pump_state) {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = msg_tx.send(PumpMsg::Exit(Err(e)));
@@ -237,10 +272,15 @@ fn pump_loop(capturer: &mut Capturer, state: &Arc<ScreenState>) -> io::Result<()
             capturer.stop_capture();
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "resolution change"));
         }
-        let mut out = Frame::new(w, h);
         let want = w as usize * h as usize * 4;
         if bgra.data.len() == want {
-            out.bgra = bgra.data;
+            // Take the capture buffer directly: `Frame::new` would zero a
+            // fresh 4K buffer (33 MB) just before it is overwritten.
+            let out = Frame {
+                width: w,
+                height: h,
+                bgra: bgra.data,
+            };
             state.publish_capture(out);
             if expected_dims.is_none() {
                 tracing::info!("first frame captured ({}x{})", w, h);

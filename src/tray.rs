@@ -6,15 +6,18 @@
 
 #![cfg(target_os = "windows")]
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::atomic::Ordering as AtomicOrdering;
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, ShellExecuteW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW,
+    Shell_NotifyIconW, ShellExecuteW, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, SHBrowseForFolderW,
+    SHGetPathFromIDListW,
 };
 use windows::Win32::Graphics::Gdi::{
     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, COLOR_WINDOW, CreateFontW, DEFAULT_CHARSET,
@@ -43,6 +46,11 @@ const C_PASS: i32 = 1007;
 const C_TITLE: i32 = 1008;
 const C_AUTOSTART: i32 = 1009;
 const C_ELEVATE: i32 = 1010;
+const C_SHARE: i32 = 1011;
+const C_SHARE_DIR: i32 = 1012;
+// Keep control IDs unique: combo-box notifications also arrive as WM_COMMAND.
+const C_BROWSE: i32 = 1013;
+const C_TLS: i32 = 1014;
 
 static UI_FONT: AtomicIsize = AtomicIsize::new(0);
 
@@ -67,6 +75,9 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 unsafe fn run() {
+    // Shell dialogs (the shared-folder picker) need an apartment-threaded COM
+    // initialisation on the thread that owns the windows.
+    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     let hinst = GetModuleHandleW(None).unwrap();
     let class = w!("restsend_vnc_tray_wnd");
     let wc = WNDCLASSW {
@@ -263,7 +274,7 @@ unsafe fn open_settings() {
         left: 0,
         top: 0,
         right: f(480),
-        bottom: f(400),
+        bottom: f(510),
     };
     let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
 
@@ -413,10 +424,66 @@ unsafe fn open_settings() {
     ctrl(
         hwnd,
         w!("BUTTON"),
-        w!("Start with Windows (current user)"),
+        w!("Share files with connected clients"),
         check,
         f(18),
         f(246),
+        f(420),
+        f(24),
+        C_SHARE,
+        hi,
+    );
+    let _ = CheckDlgButton(
+        hwnd,
+        C_SHARE,
+        DLG_BUTTON_CHECK_STATE(if s.share_files { 1 } else { 0 }),
+    );
+    ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Shared folder:"),
+        label,
+        f(18),
+        f(286),
+        f(90),
+        f(20),
+        0,
+        hi,
+    );
+    let share_dir = ctrl(
+        hwnd,
+        w!("EDIT"),
+        w!(""),
+        edit,
+        f(110),
+        f(284),
+        f(270),
+        f(24),
+        C_SHARE_DIR,
+        hi,
+    );
+    let dtxt = wide(&s.share_dir.display().to_string());
+    let _ = SetWindowTextW(share_dir, PCWSTR(dtxt.as_ptr()));
+    ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Browse..."),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        f(388),
+        f(283),
+        f(90),
+        f(26),
+        C_BROWSE,
+        hi,
+    );
+
+    ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Start with Windows (current user)"),
+        check,
+        f(18),
+        f(326),
         f(420),
         f(24),
         C_AUTOSTART,
@@ -424,13 +491,53 @@ unsafe fn open_settings() {
     );
     let _ = CheckDlgButton(hwnd, C_AUTOSTART, DLG_BUTTON_CHECK_STATE(if s.autostart { 1 } else { 0 }));
 
+    ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Encryption:"),
+        label,
+        f(18),
+        f(408),
+        f(90),
+        f(20),
+        0,
+        hi,
+    );
+    let tls = ctrl(
+        hwnd,
+        w!("COMBOBOX"),
+        w!(""),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+        f(110),
+        f(404),
+        f(320),
+        f(160),
+        C_TLS,
+        hi,
+    );
+    for t in ["Prefer TLS (recommended)", "Require TLS", "Off (plaintext)"] {
+        let wv = wide(t);
+        SendMessageW(
+            tls,
+            CB_ADDSTRING,
+            Some(WPARAM(0)),
+            Some(LPARAM(wv.as_ptr() as isize)),
+        );
+    }
+    let tls_sel = match s.tls {
+        crate::tls::Mode::Auto => 0,
+        crate::tls::Mode::Required => 1,
+        crate::tls::Mode::Off => 2,
+    };
+    let _ = SendMessageW(tls, CB_SETCURSEL, Some(WPARAM(tls_sel)), Some(LPARAM(0)));
+
     let elevate = ctrl(
         hwnd,
         w!("BUTTON"),
         w!("Install elevated autostart (admin)"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         f(18),
-        f(280),
+        f(360),
         f(300),
         f(30),
         C_ELEVATE,
@@ -445,7 +552,7 @@ unsafe fn open_settings() {
         w!("Save"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
         f(250),
-        f(340),
+        f(456),
         f(90),
         f(30),
         1,
@@ -457,7 +564,7 @@ unsafe fn open_settings() {
         w!("Cancel"),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         f(350),
-        f(340),
+        f(456),
         f(90),
         f(30),
         2,
@@ -480,6 +587,40 @@ fn read_text(hwnd: HWND, id: i32) -> String {
     }
 }
 
+/// True for a button's `BN_CLICKED` notification. Combo boxes and check boxes
+/// also send `WM_COMMAND`, so checking the notification code as well as the
+/// control ID prevents a combo selection from activating a neighbouring
+/// button (for example opening the shared-folder picker when the Encryption
+/// drop-down changes).
+fn clicked(wparam: WPARAM, id: i32) -> bool {
+    (wparam.0 & 0xffff) as i32 == id && ((wparam.0 >> 16) & 0xffff) == 0
+}
+
+/// Native "select folder" dialog for the shared-directory field.
+unsafe fn pick_folder(owner: HWND) -> Option<PathBuf> {
+    let mut display = [0u16; 260];
+    let title = wide("Select the folder shared with VNC clients");
+    let bi = BROWSEINFOW {
+        hwndOwner: owner,
+        pszDisplayName: PWSTR(display.as_mut_ptr()),
+        lpszTitle: PCWSTR(title.as_ptr()),
+        ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+        ..Default::default()
+    };
+    let pidl = SHBrowseForFolderW(&bi);
+    if pidl.is_null() {
+        return None;
+    }
+    let mut buf = [0u16; 260];
+    let ok = SHGetPathFromIDListW(pidl, &mut buf).as_bool();
+    CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
+    if !ok {
+        return None;
+    }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+}
+
 unsafe extern "system" fn settings_proc(
     hwnd: HWND,
     msg: u32,
@@ -488,8 +629,7 @@ unsafe extern "system" fn settings_proc(
 ) -> LRESULT {
     match msg {
         WM_COMMAND => {
-            let id = wparam.0 & 0xffff;
-            if id == 1 {
+            if clicked(wparam, 1) {
                 let port = read_text(hwnd, C_PORT).parse::<u16>().unwrap_or(5900);
                 let sel = SendMessageW(
                     GetDlgItem(Some(hwnd), C_COLOR).unwrap_or_default(),
@@ -502,6 +642,18 @@ unsafe extern "system" fn settings_proc(
                     2 => 8,
                     1 => 16,
                     _ => 24,
+                };
+                let tls_sel = SendMessageW(
+                    GetDlgItem(Some(hwnd), C_TLS).unwrap_or_default(),
+                    CB_GETCURSEL,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(0)),
+                )
+                .0;
+                let tls = match tls_sel {
+                    1 => crate::tls::Mode::Required,
+                    2 => crate::tls::Mode::Off,
+                    _ => crate::tls::Mode::Auto,
                 };
                 let s = crate::settings::Settings {
                     port,
@@ -521,15 +673,35 @@ unsafe extern "system" fn settings_proc(
                     // Site URL is not edited here; keep the configured/default one.
                     url: crate::settings::url(),
                     logon_task: crate::settings::current().logon_task,
+                    share_files: IsDlgButtonChecked(hwnd, C_SHARE) == 1,
+                    share_dir: {
+                        let d = read_text(hwnd, C_SHARE_DIR);
+                        if d.trim().is_empty() {
+                            crate::settings::default_share_dir()
+                        } else {
+                            PathBuf::from(d)
+                        }
+                    },
+                    // TLS certificate/key paths are configured outside this
+                    // dialog; keep the persisted/CLI values.
+                    tls,
+                    tls_cert: crate::settings::load().tls_cert,
+                    tls_key: crate::settings::load().tls_key,
                 };
                 crate::settings::save(&s);
                 crate::settings::apply_live(&s);
                 crate::autostart::set(s.autostart);
                 tracing::info!("tray: settings saved ({s:?})");
                 let _ = DestroyWindow(hwnd);
-            } else if id == 2 {
+            } else if clicked(wparam, 2) {
                 let _ = DestroyWindow(hwnd);
-            } else if id == C_ELEVATE as usize {
+            } else if clicked(wparam, C_BROWSE) {
+                if let Some(dir) = pick_folder(hwnd) {
+                    let text = wide(&dir.display().to_string());
+                    let edit = GetDlgItem(Some(hwnd), C_SHARE_DIR).unwrap_or_default();
+                    let _ = SetWindowTextW(edit, PCWSTR(text.as_ptr()));
+                }
+            } else if clicked(wparam, C_ELEVATE) {
                 let exe = std::env::current_exe().unwrap_or_default();
                 let exe_w = wide(&exe.display().to_string());
                 ShellExecuteW(
@@ -549,4 +721,19 @@ unsafe extern "system" fn settings_proc(
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clicked, C_BROWSE, C_TLS};
+    use windows::Win32::Foundation::WPARAM;
+
+    #[test]
+    fn combo_notifications_do_not_trigger_buttons() {
+        let button_click = WPARAM(C_TLS as usize); // BN_CLICKED == 0
+        let combo_change = WPARAM(C_TLS as usize | (1 << 16)); // CBN_SELCHANGE
+        assert!(clicked(button_click, C_TLS));
+        assert!(!clicked(combo_change, C_TLS));
+        assert!(!clicked(combo_change, C_BROWSE));
+    }
 }

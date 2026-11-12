@@ -301,6 +301,8 @@ mod tests {
     // Minimal temp-dir helpers (no external crate)
     mod tempdir {
         use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         pub struct TempDirGuard {
             pub path: PathBuf,
         }
@@ -311,12 +313,14 @@ mod tests {
         }
         pub fn make() -> TempDirGuard {
             let base = std::env::temp_dir().join(format!("restsend-vnc-test-{}", std::process::id()));
+            // Nanosecond timestamps can collide when tests run in parallel.
             let path = base.join(format!(
-                "t-{}",
+                "t-{}-{}",
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&path).unwrap();
             TempDirGuard { path }

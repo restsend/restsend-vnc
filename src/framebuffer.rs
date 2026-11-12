@@ -5,6 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use rayon::prelude::*;
+
+use crate::cursor::{CursorShape, CursorSnapshot, CursorStore};
+
 /// One framebuffer frame in BGRA8 layout (bytes per pixel: B, G, R, X),
 /// tightly packed (stride == width * 4).
 #[derive(Clone)]
@@ -39,29 +43,41 @@ impl Frame {
         let mut out = Frame::new(nw, nh);
         let ostride = out.stride();
         let istride = self.stride();
-        for dy in 0..nh as usize {
-            let y0 = dy * sh / nh as usize;
-            let y1 = (((dy + 1) * sh + nh as usize - 1) / nh as usize).clamp(y0 + 1, sh);
-            for dx in 0..nw as usize {
-                let x0 = dx * sw / nw as usize;
-                let x1 = (((dx + 1) * sw + nw as usize - 1) / nw as usize).clamp(x0 + 1, sw);
+        let nwu = nw as usize;
+        let nhu = nh as usize;
+        let fill_row = |dy: usize, dst: &mut [u8]| {
+            let y0 = dy * sh / nhu;
+            let y1 = (((dy + 1) * sh + nhu - 1) / nhu).clamp(y0 + 1, sh);
+            for dx in 0..nwu {
+                let x0 = dx * sw / nwu;
+                let x1 = (((dx + 1) * sw + nwu - 1) / nwu).clamp(x0 + 1, sw);
                 let (mut b, mut g, mut r) = (0u32, 0u32, 0u32);
                 let mut n = 0u32;
                 for y in y0..y1 {
-                    let row = &self.bgra[y * istride..];
+                    let src = &self.bgra[y * istride..];
                     for x in x0..x1 {
-                        let px = &row[x * 4..x * 4 + 4];
+                        let px = &src[x * 4..x * 4 + 4];
                         b += px[0] as u32;
                         g += px[1] as u32;
                         r += px[2] as u32;
                         n += 1;
                     }
                 }
-                let o = dy * ostride + dx * 4;
-                out.bgra[o] = (b / n) as u8;
-                out.bgra[o + 1] = (g / n) as u8;
-                out.bgra[o + 2] = (r / n) as u8;
-                out.bgra[o + 3] = 255;
+                let o = dx * 4;
+                dst[o] = (b / n) as u8;
+                dst[o + 1] = (g / n) as u8;
+                dst[o + 2] = (r / n) as u8;
+                dst[o + 3] = 255;
+            }
+        };
+        if nhu >= 64 && nwu * nhu >= 256 * 1024 {
+            out.bgra
+                .par_chunks_mut(ostride)
+                .enumerate()
+                .for_each(|(dy, dst)| fill_row(dy, dst));
+        } else {
+            for (dy, dst) in out.bgra.chunks_mut(ostride).enumerate() {
+                fill_row(dy, dst);
             }
         }
         out
@@ -73,6 +89,27 @@ impl Frame {
 
     /// Copies `rect` from `src` into `self` (used to keep unsent regions
     /// "pending" in a session's cached frame).
+    /// Copies an axis-aligned sub-rectangle into a new tightly packed frame.
+    /// Coordinates are clamped; the result may therefore be smaller than
+    /// requested (but is never empty for a non-empty intersection).
+    pub fn subframe(&self, x: u32, y: u32, w: u32, h: u32) -> Frame {
+        let x = x.min(self.width);
+        let y = y.min(self.height);
+        let w = w.min(self.width.saturating_sub(x));
+        let h = h.min(self.height.saturating_sub(y));
+        let mut out = Frame::new(w, h);
+        if w == 0 || h == 0 {
+            return out;
+        }
+        let (sw, dw) = (self.stride(), out.stride());
+        for row in 0..h as usize {
+            let s = (y as usize + row) * sw + x as usize * 4;
+            let d = row * dw;
+            out.bgra[d..d + w as usize * 4].copy_from_slice(&self.bgra[s..s + w as usize * 4]);
+        }
+        out
+    }
+
     pub fn copy_region(&mut self, src: &Frame, x: u32, y: u32, w: u32, h: u32) {
         if self.dims() != src.dims() {
             return;
@@ -112,6 +149,7 @@ pub struct ScreenState {
     /// Client address shown in the overlay.
     peer: Mutex<String>,
     client_info: Mutex<String>,
+    cursor_mode: Mutex<String>,
     /// Process CPU percent (x10) and resident memory (KB), sampled once/s.
     cpu_x10: AtomicU64,
     rss_kb: AtomicU64,
@@ -121,6 +159,13 @@ pub struct ScreenState {
     /// Visual input feedback for the test-pattern demo: last pointer/button
     /// state seen from a client and a keypress counter.
     pub echo: Mutex<EchoState>,
+    /// Current system cursor (shape, position, visibility), shared by all
+    /// sessions. WGC no longer burns the pointer into the captured frame.
+    cursor: Mutex<CursorStore>,
+    cursor_generation: AtomicU64,
+    /// Physical screen rect of the captured display, used to map
+    /// `GetCursorPos` coordinates into framebuffer coordinates.
+    cursor_map: Mutex<Option<(i32, i32, u32, u32)>>,
 }
 
 fn fmt_hms(secs: u64) -> String {
@@ -140,9 +185,17 @@ fn quantize(frame: &mut Frame, level: u8) {
         16 => 0xFFF8_FCF8, // R 5 bits, G 6 bits, B 5 bits
         _ => return,
     };
-    for px in frame.bgra.chunks_exact_mut(4) {
-        let v = u32::from_ne_bytes([px[0], px[1], px[2], px[3]]) & mask;
-        px.copy_from_slice(&v.to_ne_bytes());
+    let pass = |row: &mut [u8]| {
+        for px in row.chunks_exact_mut(4) {
+            let v = u32::from_ne_bytes([px[0], px[1], px[2], px[3]]) & mask;
+            px.copy_from_slice(&v.to_ne_bytes());
+        }
+    };
+    if frame.bgra.len() >= 1 << 20 {
+        let stride = frame.stride();
+        frame.bgra.par_chunks_mut(stride).for_each(|row| pass(row));
+    } else {
+        pass(&mut frame.bgra);
     }
 }
 
@@ -198,12 +251,77 @@ impl ScreenState {
             stats: Mutex::new(DebugStats::default()),
             peer: Mutex::new(String::from("-")),
             client_info: Mutex::new(String::from("-")),
+            cursor_mode: Mutex::new(String::from("-")),
             cpu_x10: AtomicU64::new(0),
             rss_kb: AtomicU64::new(0),
             started: Instant::now(),
             session_start: Mutex::new(None),
             echo: Mutex::new(EchoState::default()),
+            cursor: Mutex::new(CursorStore::default()),
+            cursor_generation: AtomicU64::new(0),
+            cursor_map: Mutex::new(None),
         }
+    }
+
+    /// Latest cursor state. Cheap: the shape is behind an `Arc`.
+    pub fn cursor_snapshot(&self) -> CursorSnapshot {
+        self.cursor.lock().unwrap().snapshot()
+    }
+
+    pub fn cursor_generation(&self) -> u64 {
+        self.cursor_generation.load(Ordering::Relaxed)
+    }
+
+    pub fn set_cursor_shape(&self, shape: Option<Arc<CursorShape>>) {
+        if self.cursor.lock().unwrap().set_shape(shape) {
+            // The pusher also waits on this counter, so a shape change wakes
+            // it even when the desktop itself is static.
+            self.cursor_generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_cursor_pos(&self, x: u16, y: u16) {
+        if self.cursor.lock().unwrap().set_pos(x, y) {
+            self.cursor_generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_cursor_visible(&self, visible: bool) {
+        if self.cursor.lock().unwrap().set_visible(visible) {
+            self.cursor_generation.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Physical rect of the captured monitor (virtual-screen coordinates).
+    pub fn set_cursor_map(&self, x: i32, y: i32, w: u32, h: u32) {
+        if w > 0 && h > 0 {
+            *self.cursor_map.lock().unwrap() = Some((x, y, w, h));
+        }
+    }
+
+    /// Maps a physical screen point to framebuffer coordinates (accounting
+    /// for `--scale` and multi-monitor origins). Returns None until the first
+    /// frame and monitor rect are known.
+    pub fn map_screen_point(&self, sx: i32, sy: i32) -> Option<(u16, u16)> {
+        let (ox, oy, mw, mh) = (*self.cursor_map.lock().unwrap())?;
+        let (fw, fh) = {
+            let frame = self.frame.read().unwrap();
+            (frame.width, frame.height)
+        };
+        if fw == 0 || fh == 0 {
+            return None;
+        }
+        let x = (sx as i64 - ox as i64) * fw as i64 / mw as i64;
+        let y = (sy as i64 - oy as i64) * fh as i64 / mh as i64;
+        if x < 0 || y < 0 || x >= fw as i64 || y >= fh as i64 {
+            return None;
+        }
+        Some((x as u16, y as u16))
+    }
+
+    /// Downscale factor applied to the framebuffer (1.0 = native).
+    pub fn scale(&self) -> f32 {
+        self.scale
     }
 
     /// Records a client pointer event for the test-pattern echo display.
@@ -260,7 +378,11 @@ impl ScreenState {
                     env!("CARGO_PKG_VERSION"),
                     &env!("BUILD_TIME").chars().take(16).collect::<String>()
                 ),
-                format!("CLI {}", self.client_info.lock().unwrap()),
+                format!(
+                    "CLI {}  CUR {}",
+                    self.client_info.lock().unwrap(),
+                    self.cursor_mode.lock().unwrap()
+                ),
                 format!(
                     "UP {}  SES {}",
                     fmt_hms(self.started.elapsed().as_secs()),
@@ -296,6 +418,12 @@ impl ScreenState {
 
     pub fn set_client_info(&self, info: String) {
         *self.client_info.lock().unwrap() = info;
+    }
+
+    /// Shows how the pointer is delivered (`client` pseudo-encoding or
+    /// `composited` by the server) in the debug overlay.
+    pub fn set_cursor_mode(&self, mode: &str) {
+        *self.cursor_mode.lock().unwrap() = mode.to_string();
     }
 
     pub fn clear_session(&self) {
@@ -389,5 +517,98 @@ mod tests {
         assert_eq!(&dst2.bgra[idx..idx + 4], &[0, 0, 255, 255]);
         let other = idx + 4;
         assert_eq!(&dst2.bgra[other..other + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn subframe_matches_copy_region() {
+        let mut src = Frame::new(8, 6);
+        for (i, px) in src.bgra.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[(i % 251) as u8, (i / 3 % 241) as u8, 7, 255]);
+        }
+        let sub = src.subframe(2, 1, 4, 3);
+        assert_eq!((sub.width, sub.height), (4, 3));
+        for y in 0..3usize {
+            for x in 0..4usize {
+                let s = ((y + 1) * 8 + x + 2) * 4;
+                let d = (y * 4 + x) * 4;
+                assert_eq!(&sub.bgra[d..d + 4], &src.bgra[s..s + 4]);
+            }
+        }
+        // Clamping never panics and never produces an oversized frame.
+        let clamped = src.subframe(6, 5, 100, 100);
+        assert_eq!((clamped.width, clamped.height), (2, 1));
+    }
+
+    #[test]
+    fn quantize_parallel_path_is_idempotent() {
+        // 512x512x4 == 1 MiB, which selects the rayon path.
+        let mut frame = Frame::new(512, 512);
+        for (i, px) in frame.bgra.chunks_exact_mut(4).enumerate() {
+            px.copy_from_slice(&[
+                (i % 256) as u8,
+                (i * 7 % 256) as u8,
+                (i * 13 % 256) as u8,
+                255,
+            ]);
+        }
+        quantize(&mut frame, 16);
+        let mask: u32 = 0xFFF8_FCF8;
+        for px in frame.bgra.chunks_exact(4) {
+            let v = u32::from_ne_bytes([px[0], px[1], px[2], px[3]]);
+            assert_eq!(v & !mask, 0);
+        }
+        // A second pass must not change anything (mask is idempotent).
+        let before = frame.bgra.clone();
+        quantize(&mut frame, 16);
+        assert_eq!(frame.bgra, before);
+    }
+
+    fn resize_reference(src: &Frame, scale: f32) -> Frame {
+        let nw = ((src.width as f32 * scale).round() as u32).max(2);
+        let nh = ((src.height as f32 * scale).round() as u32).max(2);
+        let (sw, sh) = (src.width as usize, src.height as usize);
+        let mut out = Frame::new(nw, nh);
+        let istride = src.stride();
+        let ostride = out.stride();
+        for dy in 0..nh as usize {
+            let y0 = dy * sh / nh as usize;
+            let y1 = (((dy + 1) * sh + nh as usize - 1) / nh as usize).clamp(y0 + 1, sh);
+            for dx in 0..nw as usize {
+                let x0 = dx * sw / nw as usize;
+                let x1 = (((dx + 1) * sw + nw as usize - 1) / nw as usize).clamp(x0 + 1, sw);
+                let (mut b, mut g, mut r) = (0u32, 0u32, 0u32);
+                let mut n = 0u32;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let o = y * istride + x * 4;
+                        b += src.bgra[o] as u32;
+                        g += src.bgra[o + 1] as u32;
+                        r += src.bgra[o + 2] as u32;
+                        n += 1;
+                    }
+                }
+                let o = dy * ostride + dx * 4;
+                out.bgra[o] = (b / n) as u8;
+                out.bgra[o + 1] = (g / n) as u8;
+                out.bgra[o + 2] = (r / n) as u8;
+                out.bgra[o + 3] = 255;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn resized_parallel_matches_reference() {
+        let mut src = Frame::new(1024, 1024);
+        for y in 0..1024usize {
+            for x in 0..1024usize {
+                let o = y * src.stride() + x * 4;
+                src.bgra[o..o + 4].copy_from_slice(&[x as u8, y as u8, (x ^ y) as u8, 255]);
+            }
+        }
+        let expected = resize_reference(&src, 0.5);
+        let got = src.resized(0.5);
+        assert_eq!(got.dims(), expected.dims());
+        assert_eq!(got.bgra, expected.bgra);
     }
 }

@@ -89,6 +89,21 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub share_dir: Option<PathBuf>,
 
+    /// Encryption policy: auto (prefer TLS/VeNCrypt, fall back for old
+    /// viewers), required (reject clients without VeNCrypt), or off.
+    /// Defaults to the persisted setting (auto).
+    #[arg(long, value_enum)]
+    pub tls: Option<crate::tls::Mode>,
+
+    /// TLS certificate chain in PEM format (with --tls-key). When omitted a
+    /// self-signed certificate is generated in the settings directory.
+    #[arg(long, value_name = "PEM")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// TLS private key in PEM format (with --tls-cert).
+    #[arg(long, value_name = "PEM")]
+    pub tls_key: Option<PathBuf>,
+
     /// Prevent Windows from sleeping while rvnc runs (disabled by default)
     #[arg(long)]
     pub keep_awake: bool,
@@ -120,9 +135,15 @@ pub struct Config {
     pub zrle_level: u32,
     pub name: String,
     pub test_pattern: bool,
+    /// Explicit `--share-dir` override; when unset, the live tray setting is
+    /// used for each connection.
     pub share_root: Option<Arc<ShareRoot>>,
     pub clipboard_enabled: bool,
     pub keep_awake: bool,
+    /// CLI override for the persisted encryption policy.
+    pub tls: Option<crate::tls::Mode>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Config {
@@ -182,7 +203,13 @@ impl Config {
             None => None,
         };
         if cli.share_dir.is_none() {
-            tracing::debug!("file transfer disabled (no --share-dir)");
+            tracing::debug!(
+                "no --share-dir: file transfer follows the tray setting (off by default)"
+            );
+        }
+
+        if cli.tls_cert.is_some() != cli.tls_key.is_some() {
+            return Err("--tls-cert and --tls-key must be provided together".into());
         }
 
         Ok(Config {
@@ -208,6 +235,9 @@ impl Config {
             share_root,
             clipboard_enabled: !cli.no_clipboard,
             keep_awake: cli.keep_awake,
+            tls: cli.tls,
+            tls_cert: cli.tls_cert,
+            tls_key: cli.tls_key,
         })
     }
 }

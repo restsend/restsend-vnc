@@ -6,7 +6,9 @@ use std::sync::{
 use parking_lot::Mutex;
 use windows::{
     core::{IInspectable, Interface, HSTRING},
-    Foundation::{EventRegistrationToken, Metadata::ApiInformation, TypedEventHandler},
+    Foundation::{
+        EventRegistrationToken, Metadata::ApiInformation, TimeSpan, TypedEventHandler,
+    },
     Graphics::{
         Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession},
         DirectX::{Direct3D11::IDirect3DDevice, DirectXPixelFormat},
@@ -315,6 +317,25 @@ impl GraphicsCaptureApi {
             }
         }
 
+        // Ask Windows to coalesce frames before they reach the GPU->CPU
+        // staging copy. The caller sets this from --fps; without it 4K
+        // desktops can deliver 60+ full frames per second even when the
+        // server only wants 30.
+        if let Some(fps) = std::env::var("RESTSEND_VNC_CAPTURE_FPS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|fps| *fps > 0)
+        {
+            // Optional optimisation: a missing property must never make
+            // capture fail on older Windows builds.
+            if Self::is_min_update_interval_supported().unwrap_or(false) {
+                let ticks = 10_000_000 / fps.min(1000);
+                let _ = session.SetMinUpdateInterval(TimeSpan {
+                    Duration: ticks as i64,
+                });
+            }
+        }
+
         if draw_border != DrawBorderSettings::Default {
             if Self::is_border_settings_supported()? {
                 match draw_border {
@@ -414,6 +435,15 @@ impl GraphicsCaptureApi {
         Ok(ApiInformation::IsPropertyPresent(
             &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
             &HSTRING::from("IsCursorCaptureEnabled"),
+        )? && Self::is_supported()?)
+    }
+
+    /// Check if the capture session supports a minimum update interval.
+    #[inline]
+    pub fn is_min_update_interval_supported() -> Result<bool, Error> {
+        Ok(ApiInformation::IsPropertyPresent(
+            &HSTRING::from("Windows.Graphics.Capture.GraphicsCaptureSession"),
+            &HSTRING::from("MinUpdateInterval"),
         )? && Self::is_supported()?)
     }
 
