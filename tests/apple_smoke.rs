@@ -398,6 +398,11 @@ fn apple_session_starts_encrypted_record_layer() {
     let accepts = |cmd: u8| caps[cmd as usize / 8] & (0x80 >> (cmd % 8)) != 0;
     assert!(accepts(0x12), "SetEncryption not advertised");
     assert!(accepts(0x21), "ViewerInfo not advertised");
+    assert!(accepts(0x15), "AutoPasteboard not advertised");
+    assert!(accepts(0x0b), "ClipboardFetch not advertised");
+    assert!(accepts(0x1f), "ClipboardSend not advertised");
+    assert!(accepts(0x20), "Drag not advertised despite --share-dir");
+    assert!(accepts(0x22), "FileCopy not advertised despite --share-dir");
 
     // Prelude: ViewerInfo, then request encryption.
     let mut viewer_info = vec![0x21u8, 0, 0, 0x3E, 0, 1];
@@ -627,4 +632,6 @@ fn apple_session_starts_encrypted_record_layer() {
     s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     let mut more = vec![0u8; 1];
     let _ = s.read(&mut more); // must not be a reset (read_exact would error)
+    let _ = std::fs::remove_file(&clip_file);
+    let _ = std::fs::remove_dir_all(&share_dir);
 }

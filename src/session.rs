@@ -2282,12 +2282,14 @@ mod cursor_mode_tests {
     use crate::rfb::messages::pseudo;
 
     #[test]
-    fn apple_clients_always_get_the_composited_cursor() {
+    fn encrypted_apple_sessions_get_the_composited_cursor() {
         // Screen Sharing advertises -239 but does not draw it reliably.
         let encodings = [16, 0, pseudo::RICH_CURSOR, pseudo::POINTER_POS];
         assert!(!use_client_cursor(true, false, &encodings));
         // Even an explicit opt-out request is irrelevant for Apple clients.
         assert!(!use_client_cursor(true, true, &encodings));
+        // The NO_EXT diagnostic path keeps the client cursor.
+        assert!(use_client_cursor(false, false, &encodings));
     }
 
     #[test]
