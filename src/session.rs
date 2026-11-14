@@ -37,6 +37,11 @@ use crate::throttle::{cursor_interval, ByteBudget};
 /// Hard cap on the wire bytes of one framebuffer update. The time budget
 /// below is the primary limiter; this only prevents pathological messages.
 const MAX_UPDATE_BYTES: usize = 2 << 20;
+/// Apple Screen Sharing treats each ARD record body as one RFB message, so an
+/// encrypted framebuffer update must fit in a single record (<= 65498 bytes).
+/// Keep a margin for the FBU and rectangle headers.
+const APPLE_UPDATE_BYTES: usize = 60 << 10;
+const APPLE_RECT_RAW: usize = APPLE_UPDATE_BYTES - 1024;
 /// Bytes allowed to be queued/in flight before the pusher stops encoding.
 /// Keeping roughly one 4K update in flight bounds latency without starving
 /// the link. Larger than one max update so a burst can drain.
@@ -298,6 +303,16 @@ pub fn handle_client(
 
         force_next: false,
         pending: Vec::new(),
+        max_update_bytes: if apple_client {
+            APPLE_UPDATE_BYTES
+        } else {
+            MAX_UPDATE_BYTES
+        },
+        max_rect_raw: if apple_client {
+            APPLE_RECT_RAW
+        } else {
+            MAX_RECT_RAW
+        },
         last_frame_gen: u64::MAX,
         cursor_shape_serial_sent: 0,
         cursor_pos_sent: (u16::MAX, u16::MAX),
@@ -362,6 +377,7 @@ pub fn handle_client(
         apple_record_iv: None,
         apple_started: false,
         apple_ready: Arc::clone(&apple_ready),
+        apple_display_sent: false,
         apple_pasteboard,
         apple_auto_cmd: None,
         ard_upload: None,
@@ -498,7 +514,7 @@ fn writer_loop(
                 let ok = match cipher.as_mut() {
                     None => stream.write_all(&data).is_ok(),
                     Some(c) => data
-                        .chunks(0x8000)
+                        .chunks(crate::rfb::apple_auth::MAX_RECORD_BODY)
                         .all(|chunk| stream.write_all(&c.seal(chunk)).is_ok()),
                 };
                 // The bytes are out of our hands (or the connection died);
@@ -520,7 +536,7 @@ fn writer_loop(
                 match cipher.as_mut() {
                     None => stream.write_all(&data).is_ok(),
                     Some(c) => data
-                        .chunks(0x8000)
+                        .chunks(crate::rfb::apple_auth::MAX_RECORD_BODY)
                         .all(|chunk| stream.write_all(&c.seal(chunk)).is_ok()),
                 }
             }
@@ -530,6 +546,39 @@ fn writer_loop(
         }
         let _ = stream.flush();
     }
+}
+
+/// ARD AppleDisplayLayout pseudo-rect (encoding 1105). Screen Sharing uses
+/// this to size its framebuffer/decoder before the first pixel update; without
+/// it the codecs reject the first frame ("unexpected frame update").
+fn apple_display_layout_message(width: u16, height: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(0x14 + 0x38 + 2);
+    body.extend_from_slice(&5u16.to_be_bytes()); // version
+    body.extend_from_slice(&width.to_be_bytes()); // desktop (points)
+    body.extend_from_slice(&height.to_be_bytes());
+    body.extend_from_slice(&width.to_be_bytes()); // framebuffer (pixels)
+    body.extend_from_slice(&height.to_be_bytes());
+    body.extend_from_slice(&0xffff_ffffu32.to_be_bytes()); // all displays
+    body.extend_from_slice(&4u32.to_be_bytes()); // session state: on console
+    body.extend_from_slice(&1u16.to_be_bytes()); // display count
+    body.extend_from_slice(&1.0f64.to_be_bytes()); // density
+    body.extend_from_slice(&1.0f64.to_be_bytes()); // scale
+    body.extend_from_slice(&1u32.to_be_bytes()); // display id
+    for _ in 0..2 {
+        // logical rect (top, left, bottom, right), then backing rect
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        body.extend_from_slice(&height.to_be_bytes());
+        body.extend_from_slice(&width.to_be_bytes());
+    }
+    body.extend_from_slice(&1u32.to_be_bytes()); // main display
+    PixelFormat::native().write(&mut body);
+
+    let mut out = messages::framebuffer_update_header(1);
+    out.extend_from_slice(&messages::rect_header(0, 0, 0, 0, 1105));
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(&body);
+    out
 }
 
 /// Capability bitmap for the extended ARD ServerInit: bit N (MSB-first)
@@ -682,6 +731,12 @@ struct Updater {
     force_next: bool,
     /// Rects deferred by the time budget, sent first on the next tick.
     pending: Vec<Rect>,
+    /// Per-update wire cap. Apple clients get one RFB message per record, so a
+    /// framebuffer update must fit in a single record (~64 KiB).
+    max_update_bytes: usize,
+    /// Largest raw rect to encode before splitting into strips (keeps one
+    /// rectangle's payload inside `max_update_bytes`).
+    max_rect_raw: usize,
     /// Last frame generation we pushed.
     last_frame_gen: u64,
     /// Cursor state last acknowledged by the client.
@@ -956,7 +1011,7 @@ impl Updater {
 
     fn send_update(&mut self, incremental: bool, region: Rect) -> std::io::Result<UpdateStatus> {
         // Reserve the worst-case update size before touching the zlib stream.
-        let reserved = MAX_UPDATE_BYTES + (64 << 10);
+        let reserved = self.max_update_bytes + (64 << 10);
         if !self.frame_budget.try_reserve(reserved) {
             return Ok(UpdateStatus::Skipped);
         }
@@ -1027,7 +1082,7 @@ impl Updater {
                 &mut expanded,
                 r,
                 encoder.bytes_per_pixel().max(1),
-                MAX_RECT_RAW,
+                self.max_rect_raw,
             );
         }
         rects = expanded;
@@ -1054,7 +1109,7 @@ impl Updater {
         for rect in rects.drain(..) {
             let estimate = rect.w as usize * rect.h as usize * encoder.bytes_per_pixel();
             if !payloads.is_empty()
-                && (encode_started.elapsed() >= budget || total + estimate > MAX_UPDATE_BYTES)
+                && (encode_started.elapsed() >= budget || total + estimate > self.max_update_bytes)
             {
                 unsent.push(rect);
                 continue;
@@ -1318,6 +1373,8 @@ struct Session {
     apple_started: bool,
     /// Set when the client switches its own stream to records (`0x12 cmd=2`).
     apple_ready: Arc<AtomicBool>,
+    /// Whether the ARD DisplayInfo pseudo-rect was queued.
+    apple_display_sent: bool,
     /// Set by `0x15` selector 1: the viewer enabled shared pasteboard.
     apple_pasteboard: Arc<AtomicBool>,
     /// Last auto-pasteboard command from the viewer (1 = enabled).
@@ -1367,6 +1424,14 @@ impl Session {
             if let ClientMessage::AppleSetEncryption { command, .. } = msg {
                 self.handle_set_encryption(command, &mut stream, peer)?;
                 continue;
+            }
+            // Once the ARD record layer is active, the viewer's first
+            // encrypted message is its post-encryption preface (usually a
+            // second SetEncodings). Only then may the pusher send frames:
+            // Screen Sharing rejects an unsolicited framebuffer update with
+            // "unexpected frame update".
+            if self.apple_client && self.apple_ready.load(Ordering::Acquire) {
+                self.client_ready.store(true, Ordering::Release);
             }
             self.dispatch(msg, peer, &mut stream)?;
         }
@@ -1532,6 +1597,22 @@ impl Session {
                     // record-layer key when it sends this marker.
                     self.apple_key = Some(key);
                     self.apple_ready.store(true, Ordering::Release);
+                    if !self.apple_display_sent {
+                        self.apple_display_sent = true;
+                        let (w, h) = self.screen_dims;
+                        let msg = apple_display_layout_message(w as u16, h as u16);
+                        self.queue(OutMsg::Data(msg))?;
+                    }
+                    // Fallback: if the viewer sends no encrypted preface,
+                    // start pushing after a short grace period.
+                    let ready = Arc::clone(&self.client_ready);
+                    std::thread::Builder::new()
+                        .name("restsend-vnc-ard-push".into())
+                        .spawn(move || {
+                            std::thread::sleep(Duration::from_millis(300));
+                            ready.store(true, Ordering::Relaxed);
+                        })
+                        .ok();
                     tracing::info!("{peer}: ARD record layer active (client -> server)");
                 }
             }
@@ -1554,9 +1635,11 @@ impl Session {
         getrandom::fill(&mut key).map_err(|e| std::io::Error::other(e.to_string()))?;
         getrandom::fill(&mut iv).map_err(|e| std::io::Error::other(e.to_string()))?;
         let setup = crate::rfb::apple_auth::encryption_setup_message(&dh_key, &key, &iv);
+        let reset = std::env::var_os("RESTSEND_VNC_APPLE_CBC_RESET").is_some();
         self.queue(OutMsg::StartEncryption {
             setup,
-            cipher: crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, 0),
+            cipher: crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, 0)
+                .with_iv_reset(reset),
         })?;
         self.apple_record_key = Some(key);
         self.apple_record_iv = Some(iv);
@@ -1605,8 +1688,12 @@ impl Session {
                 );
                 // Client finished negotiating encodings: the pusher may now
                 // start sending frames (Apple clients wait for server-push).
+                // When the ARD record layer is requested, wait for the
+                // viewer's encrypted preface instead (see Session::run).
                 use std::sync::atomic::Ordering;
-                self.client_ready.store(true, Ordering::Relaxed);
+                if !(self.apple_client && self.apple_started) {
+                    self.client_ready.store(true, Ordering::Relaxed);
+                }
             }
             ClientMessage::FramebufferUpdateRequest { .. } => {
                 // Server-push model: the pusher thread publishes updates at
