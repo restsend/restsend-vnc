@@ -120,6 +120,8 @@ about 3.8 MB (down from 4.9 MB with thin LTO).
 ## Notes
 
 - Elevated windows (Task Manager, UAC) require running as administrator (Windows UIPI)
+- Punctuation and non-ASCII characters are injected as Unicode text (the exact character, regardless of host keyboard layout and without going through the host IME); letters, digits and space use virtual keys so shortcuts (Ctrl+C, Alt+Tab) keep working, and punctuation pressed together with Ctrl/Alt also keeps its virtual key so editor chords like Ctrl+/ still fire
+- The capture session is recreated after lock/unlock and after sleep/hibernate resume, because Windows.Graphics.Capture resumes without its yellow screen-sharing border
 - Connection confirmation fails closed: a console build prompts on stdin, and rejects the connection when no terminal/UI is available
 - Internal test hooks: `RESTSEND_VNC_APPROVAL=accept|reject|timeout`, `RESTSEND_VNC_APPROVAL_TIMEOUT_MS`, and `RESTSEND_VNC_ALLOW_MULTIPLE=1` (bypass the single-instance mutex) are used by the integration tests
 - Apple clients only allow shared clipboard on encrypted ARD sessions
