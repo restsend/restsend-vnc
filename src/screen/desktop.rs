@@ -170,6 +170,15 @@ impl GraphicsCaptureApiHandler for CaptureHandler {
     }
 }
 
+/// Why a [`capture_session`] call returned.
+#[derive(Debug)]
+enum CaptureExit {
+    /// Global shutdown requested; the supervisor should return.
+    Stopped,
+    /// Planned restart (lock/unlock or sleep/resume): recreate the session.
+    Restarted,
+}
+
 fn run(display_index: usize, fps: u32, state: Arc<ScreenState>) {
     let mut stale_starts = 0u32;
     loop {
@@ -178,7 +187,13 @@ fn run(display_index: usize, fps: u32, state: Arc<ScreenState>) {
         }
         let generation_before = state.generation();
         match capture_session(display_index, fps, &state) {
-            Ok(()) => return, // stopped
+            Ok(CaptureExit::Stopped) => return, // stopped
+            Ok(CaptureExit::Restarted) => {
+                // Planned restart (lock/unlock or sleep/resume transition):
+                // not a failure, so it neither counts as stale nor waits.
+                stale_starts = 0;
+                continue;
+            }
             Err(e) => {
                 if state.generation() == generation_before {
                     stale_starts += 1;
@@ -202,7 +217,7 @@ fn capture_session(
     display_index: usize,
     fps: u32,
     state: &Arc<ScreenState>,
-) -> Result<(), io::Error> {
+) -> Result<CaptureExit, io::Error> {
     let monitor = pick_monitor(display_index)?;
     remember_display_rect(&monitor, state);
     if let (Ok(w), Ok(h)) = (monitor.width(), monitor.height()) {
@@ -250,11 +265,19 @@ fn capture_session(
     loop {
         if state.is_stopped() {
             let _ = control.stop();
-            return Ok(());
+            return Ok(CaptureExit::Stopped);
+        }
+        if state.take_capture_restart() {
+            // Windows.Graphics.Capture keeps delivering frames after a
+            // lock/unlock or sleep/resume but stops drawing its yellow
+            // capture border; only a fresh session restores it.
+            tracing::info!("recreating the capture session to restore the capture border");
+            let _ = control.stop();
+            return Ok(CaptureExit::Restarted);
         }
         if control.is_finished() {
             return match control.wait() {
-                Ok(()) if state.is_stopped() => Ok(()),
+                Ok(()) if state.is_stopped() => Ok(CaptureExit::Stopped),
                 Ok(()) => Err(io::Error::other("capture session ended unexpectedly")),
                 Err(e) => Err(io::Error::other(format!("capture session ended: {e}"))),
             };

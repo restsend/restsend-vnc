@@ -168,6 +168,11 @@ pub struct ScreenState {
     /// `GetCursorPos` coordinates into framebuffer coordinates.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     cursor_map: Mutex<Option<(i32, i32, u32, u32)>>,
+    /// Set when the capture session should be dropped and recreated (after
+    /// lock/unlock or sleep/resume, Windows.Graphics.Capture resumes without
+    /// its yellow capture border).
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    capture_restart: AtomicBool,
 }
 
 fn fmt_hms(secs: u64) -> String {
@@ -264,6 +269,7 @@ impl ScreenState {
             cursor: Mutex::new(CursorStore::default()),
             cursor_generation: AtomicU64::new(0),
             cursor_map: Mutex::new(None),
+            capture_restart: AtomicBool::new(false),
         }
     }
 
@@ -505,6 +511,20 @@ impl ScreenState {
     pub fn is_stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
+
+    /// Asks the capture supervisor to drop and recreate the capture session.
+    /// Windows.Graphics.Capture resumes after lock/unlock or sleep without
+    /// redrawing its yellow capture border; only a fresh session restores it.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn request_capture_restart(&self) {
+        self.capture_restart.store(true, Ordering::Relaxed);
+    }
+
+    /// Consumes a pending capture-restart request.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn take_capture_restart(&self) -> bool {
+        self.capture_restart.swap(false, Ordering::Relaxed)
+    }
 }
 
 #[cfg(test)]
@@ -619,5 +639,16 @@ mod tests {
         let got = src.resized(0.5);
         assert_eq!(got.dims(), expected.dims());
         assert_eq!(got.bgra, expected.bgra);
+    }
+
+    #[test]
+    fn capture_restart_request_is_one_shot() {
+        let state = ScreenState::with_color_level(30, 24);
+        assert!(!state.take_capture_restart());
+        state.request_capture_restart();
+        assert!(state.take_capture_restart());
+        // Consumed: a second take must return false so the supervisor does
+        // not restart in a loop.
+        assert!(!state.take_capture_restart());
     }
 }

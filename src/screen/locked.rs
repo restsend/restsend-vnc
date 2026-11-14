@@ -5,6 +5,7 @@
 //! locked, which would otherwise leave viewers staring at a frozen image with
 //! no explanation. A small watchdog publishes a rendered notice instead.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -15,6 +16,9 @@ use crate::framebuffer::{Frame, ScreenState};
 /// startup): the ServerInit would otherwise advertise a 0x0 framebuffer.
 const FALLBACK_W: u32 = 1280;
 const FALLBACK_H: u32 = 720;
+
+/// Set by the power callback when the system resumes from sleep/hibernate.
+static RESUMED: AtomicBool = AtomicBool::new(false);
 
 pub fn spawn(state: Arc<ScreenState>) -> JoinHandle<()> {
     std::thread::Builder::new()
@@ -31,6 +35,7 @@ fn run(state: Arc<ScreenState>) {
     let mut unlocked_streak = 0u32;
     let mut last_capture_gen = state.capture_generation();
     let mut last_capture_change = Instant::now();
+    register_resume_notification();
     loop {
         if state.is_stopped() {
             return;
@@ -39,6 +44,16 @@ fn run(state: Arc<ScreenState>) {
         if gen != last_capture_gen {
             last_capture_gen = gen;
             last_capture_change = Instant::now();
+        }
+        if RESUMED.swap(false, Ordering::Relaxed) {
+            // Sleep / hibernate cycle: Windows.Graphics.Capture resumes
+            // without its yellow capture border, so the session must be
+            // recreated once the desktop is back.
+            tracing::info!("system resumed from sleep — recreating the capture session");
+            state.request_capture_restart();
+            // The first lock reading after a resume is not trustworthy.
+            locked_streak = 0;
+            unlocked_streak = 0;
         }
         if is_locked() {
             locked_streak += 1;
@@ -70,12 +85,63 @@ fn run(state: Arc<ScreenState>) {
             };
             state.publish(render(w, h));
         } else if unlocked_streak >= 2 && announced {
-            tracing::info!("Windows session unlocked — capture resumes");
+            // The capture usually resumes after an unlock but without its
+            // yellow border; drop and recreate the session so it comes back.
+            tracing::info!("Windows session unlocked — recreating the capture session");
             announced = false;
+            state.request_capture_restart();
         }
         std::thread::sleep(Duration::from_millis(500));
     }
 }
+
+/// Subscribes to suspend/resume notifications so [`RESUMED`] is set when the
+/// system wakes up (covers sleep/hibernate with and without a lock screen).
+#[cfg(target_os = "windows")]
+fn register_resume_notification() {
+    use std::ptr;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Power::{
+        PowerRegisterSuspendResumeNotification, DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::DEVICE_NOTIFY_CALLBACK;
+
+    // PBT_APMXSUSPEND == 4, PBT_APMXRESUME == 18.
+    extern "system" fn power_callback(
+        _ctx: *const std::ffi::c_void,
+        ptype: u32,
+        _s: *const std::ffi::c_void,
+    ) -> u32 {
+        if ptype == 18 {
+            RESUMED.store(true, Ordering::Relaxed);
+        }
+        0
+    }
+
+    // The parameters must outlive the registration; the raw pointer inside
+    // makes the struct !Sync, hence the wrapper.
+    struct Params(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS);
+    unsafe impl Sync for Params {}
+    static PARAMS: Params = Params(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
+        Callback: Some(power_callback),
+        Context: ptr::null_mut(),
+    });
+
+    let mut handle: *mut std::ffi::c_void = ptr::null_mut();
+    let rc = unsafe {
+        PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, HANDLE(&PARAMS.0 as *const _ as *mut _), &mut handle)
+    };
+    if rc.is_err() {
+        tracing::warn!("cannot register suspend/resume notifications: {rc:?}");
+        return;
+    }
+    // The registration is never unregistered: the watchdog thread runs until
+    // process shutdown, which invalidates it anyway.
+    tracing::debug!("suspend/resume notifications registered");
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_resume_notification() {}
 
 /// True when the interactive session is locked / a secure desktop is up.
 #[cfg(target_os = "windows")]
