@@ -17,6 +17,8 @@
 //! The stream continues unencrypted after authentication (same as neatvnc),
 //! so this alone is not MITM-proof — fine on a trusted LAN.
 
+use std::io::{self, Read};
+
 use aes::Aes128;
 use cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
 use md5::{Digest, Md5};
@@ -111,43 +113,6 @@ impl SessionCipher {
     }
 }
 
-/// Builds one ARD server->client control message (AppleVNCServer's
-/// `EncryptOneMessage`):
-///
-/// ```text
-/// total = (payload.len() + 0x25) & !0xF
-/// plain[0..2]  = BE16(payload.len())
-/// plain[2..2+n] = payload
-/// plain[..total-20] zero padded
-/// plain[total-20..] = SHA1(BE32(seq) || plain[..total-20])
-/// wire = AES-128-ECB(plain)
-/// ```
-///
-/// `seq` is a per-session, per-direction counter starting at 0 and bumped for
-/// every message. The client uses it to reject replayed/reordered messages.
-#[allow(dead_code)]
-pub fn encrypt_server_message(key: &[u8; 16], seq: u32, payload: &[u8]) -> Vec<u8> {
-    use aes::cipher::BlockEncrypt;
-    use sha1::{Digest as _, Sha1};
-
-    let total = (payload.len() + 0x25) & !0xF;
-    let mut out = vec![0u8; total];
-    out[..2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
-    out[2..2 + payload.len()].copy_from_slice(payload);
-
-    let body = total - 20;
-    let mut sha = Sha1::new();
-    sha.update(seq.to_be_bytes());
-    sha.update(&out[..body]);
-    out[body..].copy_from_slice(&sha.finalize());
-
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    for block in out.as_chunks_mut::<16>().0 {
-        cipher.encrypt_block(block.into());
-    }
-    out
-}
-
 /// Payload of an ARD `AutoPasteboardInfo` control message (type `0x14`).
 ///
 /// `cmd` observed in AppleVNCServer: `2` after the server pasteboard changed,
@@ -156,11 +121,24 @@ pub fn auto_pasteboard_info(cmd: u8) -> [u8; 8] {
     [0x14, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, cmd]
 }
 
-/// AES-128-CBC stream cipher for the ARD server->client encrypted channel.
+/// AES-128-CBC stream cipher for the ARD record layer.
 ///
-/// AppleVNCServer keeps one `CCCryptorRef` per session and calls
+/// AppleVNCServer keeps one `CCCryptorRef` per direction and calls
 /// `CCCryptorUpdate` for every record, so the CBC chaining state (and thus
 /// the effective IV) carries over from one record to the next.
+///
+/// Wire format (both directions):
+/// ```text
+/// u16  ciphertext_len                    (multiple of 16)
+/// u8   ciphertext[ciphertext_len]
+/// ```
+/// Plaintext inside the ciphertext:
+/// ```text
+/// u16  body_len
+/// u8   body[body_len]
+/// u8   zero padding
+/// 20B  SHA1(BE32(seq) || plaintext-before-tag)
+/// ```
 pub struct AppleStreamCipher {
     key: [u8; 16],
     iv: [u8; 16],
@@ -195,10 +173,11 @@ impl AppleStreamCipher {
     }
 
     /// Seals one record: `BE16(len) || payload || 0..0 || SHA1(BE32(seq)||body)`
-    /// padded to `(len + 0x25) & !0xF`, then CBC-encrypted.
+    /// padded to `(len + 0x25) & !0xF`, CBC-encrypted, and prefixed with the
+    /// outer `u16` ciphertext length.
     pub fn seal(&mut self, payload: &[u8]) -> Vec<u8> {
         use sha1::{Digest as _, Sha1};
-        debug_assert!(payload.len() <= 0xFFFF);
+        debug_assert!(payload.len() <= MAX_RECORD_BODY);
         let total = (payload.len() + 0x25) & !0xF;
         let mut out = vec![0u8; total];
         out[..2].copy_from_slice(&(payload.len() as u16).to_be_bytes());
@@ -215,15 +194,142 @@ impl AppleStreamCipher {
         }
 
         self.cbc_encrypt(&mut out);
-        out
+
+        let mut wire = Vec::with_capacity(2 + total);
+        wire.extend_from_slice(&(total as u16).to_be_bytes());
+        wire.extend_from_slice(&out);
+        wire
     }
 }
 
 impl AppleStreamCipher {
+    #[allow(dead_code)]
     pub fn with_iv_reset(mut self, reset: bool) -> Self {
         self.reset_iv = reset;
         self
     }
+}
+
+/// Largest body that still fits one record: `(body + 0x25) & !0xF <= 0xFFFF`.
+pub const MAX_RECORD_BODY: usize = 65535 - 0x25;
+
+/// Streaming decoder for the ARD record layer (client -> server direction).
+///
+/// Holds the CBC state and sequence counter, and exposes each decrypted
+/// record body as a byte stream so the ordinary RFB message parser can read
+/// straight through record boundaries.
+pub struct RecordDecoder {
+    cipher: Aes128,
+    iv: [u8; 16],
+    seq: u32,
+    body: Vec<u8>,
+    pos: usize,
+}
+
+impl RecordDecoder {
+    pub fn new(key: [u8; 16], iv: [u8; 16]) -> Self {
+        RecordDecoder {
+            cipher: Aes128::new(GenericArray::from_slice(&key)),
+            iv,
+            seq: 0,
+            body: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn cbc_decrypt(&mut self, data: &mut [u8]) {
+        for block in data.as_chunks_mut::<16>().0 {
+            let mut ciphertext = [0u8; 16];
+            ciphertext.copy_from_slice(block);
+            self.cipher
+                .decrypt_block(GenericArray::from_mut_slice(block));
+            for (b, prev) in block.iter_mut().zip(self.iv.iter()) {
+                *b ^= *prev;
+            }
+            self.iv = ciphertext;
+        }
+    }
+
+    /// Reads one record, decrypts it, verifies the SHA-1 trailer and buffers
+    /// its body. Returns an error on framing, authentication or I/O failure.
+    pub fn fill(&mut self, r: &mut impl Read) -> io::Result<()> {
+        use sha1::{Digest as _, Sha1};
+
+        let mut len = [0u8; 2];
+        r.read_exact(&mut len)?;
+        let size = u16::from_be_bytes(len) as usize;
+        if size < 32 || !size.is_multiple_of(16) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bad ARD record length {size}"),
+            ));
+        }
+        let mut buf = vec![0u8; size];
+        r.read_exact(&mut buf)?;
+        self.cbc_decrypt(&mut buf);
+
+        let body_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+        let tag_at = size - 20;
+        if 2 + body_len > tag_at {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ARD record body {body_len} does not fit in {size}"),
+            ));
+        }
+        let mut sha = Sha1::new();
+        sha.update(self.seq.to_be_bytes());
+        sha.update(&buf[..tag_at]);
+        let tag = sha.finalize();
+        if tag.as_slice() != &buf[tag_at..] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("ARD record {} failed its SHA-1 check", self.seq),
+            ));
+        }
+        self.seq = self.seq.wrapping_add(1);
+        self.body.clear();
+        self.body.extend_from_slice(&buf[2..2 + body_len]);
+        self.pos = 0;
+        Ok(())
+    }
+
+    /// Reads decrypted bytes from the current record, pulling further records
+    /// from `r` as needed. Never returns `Ok(0)` unless the peer is at EOF.
+    pub fn read(&mut self, r: &mut impl Read, out: &mut [u8]) -> io::Result<usize> {
+        while self.pos >= self.body.len() {
+            self.fill(r)?;
+            if self.body.is_empty() {
+                // An empty record is legal; keep going instead of signalling EOF.
+                if out.is_empty() {
+                    return Ok(0);
+                }
+            }
+        }
+        let n = out.len().min(self.body.len() - self.pos);
+        out[..n].copy_from_slice(&self.body[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Reads the generated session keys out of a rekey body
+/// (`u32 generation || AES-ECB(key) || AES-ECB(iv)`).
+#[allow(dead_code)]
+pub fn unwrap_rekey(wrap_key: &[u8; 16], body: &[u8]) -> io::Result<([u8; 16], [u8; 16])> {
+    if body.len() != 36 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("rekey body is {} bytes, want 36", body.len()),
+        ));
+    }
+    let cipher = Aes128::new(GenericArray::from_slice(wrap_key));
+    let mut key = [0u8; 16];
+    let mut iv = [0u8; 16];
+    key.copy_from_slice(&body[4..20]);
+    iv.copy_from_slice(&body[20..36]);
+    cipher.decrypt_block(GenericArray::from_mut_slice(&mut key));
+    cipher.decrypt_block(GenericArray::from_mut_slice(&mut iv));
+    Ok((key, iv))
 }
 
 /// Encrypts one 16-byte block with AES-128-ECB (DH session key).
@@ -304,8 +410,6 @@ fn zero_trim(bytes: &[u8]) -> &[u8] {
     &bytes[..end]
 }
 
-use std::io;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +476,66 @@ mod tests {
         assert_eq!(msg.len(), 4 + KEY_LEN * 2);
         assert_eq!(&msg[0..2], &2u16.to_be_bytes()); // generator
         assert_eq!(&msg[2..4], &256u16.to_be_bytes()); // key size
+    }
+
+    #[test]
+    fn record_layer_roundtrip() {
+        use std::io::Cursor;
+        let key = [7u8; 16];
+        let iv = [9u8; 16];
+        let message = b"hello record layer";
+        let mut enc = AppleStreamCipher::new(key, iv, 0);
+        let first = enc.seal(message);
+        let second = enc.seal(b"second");
+        assert_eq!(
+            u16::from_be_bytes([first[0], first[1]]) as usize,
+            first.len() - 2
+        );
+        assert_eq!((first.len() - 2) % 16, 0);
+
+        let mut wire = first;
+        wire.extend_from_slice(&second);
+        let mut dec = RecordDecoder::new(key, iv);
+        let mut r = Cursor::new(wire);
+        let mut got = vec![0u8; message.len()];
+        dec.read(&mut r, &mut got).unwrap();
+        assert_eq!(&got, message);
+        let mut got2 = [0u8; 6];
+        dec.read(&mut r, &mut got2).unwrap();
+        assert_eq!(&got2, b"second");
+        assert_eq!(dec.seq, 2);
+    }
+
+    #[test]
+    fn record_layer_rejects_tampering() {
+        use std::io::Cursor;
+        let key = [1u8; 16];
+        let iv = [2u8; 16];
+        let mut enc = AppleStreamCipher::new(key, iv, 0);
+        let mut wire = enc.seal(b"secret");
+        let last = wire.len() - 1;
+        wire[last] ^= 0xff;
+        let mut dec = RecordDecoder::new(key, iv);
+        let mut r = Cursor::new(wire);
+        let mut out = [0u8; 8];
+        assert!(dec.read(&mut r, &mut out).is_err());
+    }
+
+    #[test]
+    fn unwarps_rekey_body() {
+        let wrap = [3u8; 16];
+        let mut key = [4u8; 16];
+        let mut iv = [5u8; 16];
+        let mut body = vec![0u8, 0, 0, 1];
+        body.extend_from_slice(&encrypt_ecb(&wrap, &mut key));
+        body.extend_from_slice(&encrypt_ecb(&wrap, &mut iv));
+        let (got_key, got_iv) = unwrap_rekey(&wrap, &body).unwrap();
+        assert_eq!(got_key, [4u8; 16]);
+        assert_eq!(got_iv, [5u8; 16]);
+    }
+
+    fn encrypt_ecb(key: &[u8; 16], block: &mut [u8; 16]) -> [u8; 16] {
+        encrypt_ecb_block(key, block);
+        *block
     }
 }

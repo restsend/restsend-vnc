@@ -10,7 +10,7 @@
 //!   driven here for every client uniformly);
 //! - writer thread: serialises all socket writes from a bounded channel.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -75,8 +75,13 @@ enum OutMsg {
     Data(Vec<u8>),
     /// A framebuffer update, counted against the byte budget until written.
     Frame(Vec<u8>),
-    /// Switch the Apple 3.889 writer to the encrypted frame channel.
-    Activate(crate::rfb::apple_auth::AppleStreamCipher),
+    /// Write the plaintext ARD 1103 setup rect, then switch the writer to the
+    /// encrypted record layer. Kept as one message so the pusher cannot
+    /// interleave a plaintext frame between the two steps.
+    StartEncryption {
+        setup: Vec<u8>,
+        cipher: crate::rfb::apple_auth::AppleStreamCipher,
+    },
 }
 
 pub fn handle_client(
@@ -196,29 +201,30 @@ pub fn handle_client(
     // Apple 3.889 clients set the high bit in ClientInit and expect the
     // extended ARD ServerInit ("RFBServerInfo2"): a u32 extra length, then
     // 22 bytes of server information followed by the machine name.
-    let extended = std::env::var_os("RESTSEND_VNC_APPLE_EXTINIT").is_some()
-        && (hs.minor == 889 || hs.client_init & 0x80 != 0);
+    let extended = (hs.minor == 889 || hs.client_init & 0x80 != 0)
+        && std::env::var_os("RESTSEND_VNC_APPLE_NO_EXT").is_none();
     if extended {
         let extralen = 22 + cfg.name.len();
         init.extend_from_slice(&(extralen as u32).to_be_bytes());
         init.extend_from_slice(&[0u8, 0u8]); // u16 reserved
-        let flags: u32 = std::env::var("RESTSEND_VNC_APPLE_FLAGS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        init.extend_from_slice(&flags.to_be_bytes()); // flags (bit0/bit1)
-                                                      // Server info block (AppleVNCServer's gServerInfo: magic + feature
-                                                      // flags; the default table advertises commands 34..39).
-                                                      // Capability bitmask. Byte 2 bit 5 (command 18) advertises stream
-                                                      // encryption; clearing it keeps frames plaintext while the clipboard
-                                                      // bits (commands 25/35, byte 3 bit 6 / byte 4 bit 4) stay set.
-        let no_enc = std::env::var_os("RESTSEND_VNC_APPLE_NO_ENC").is_some();
-        let mut caps = [
-            0xbf, 0xf6, 0xe7, 0xe3, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00,
-        ];
-        if no_enc {
-            caps[2] &= !0x20;
+        // bit 4 = extended info, bit 1 = control privilege, bits 5..7 = max
+        // virtual displays (1). View-only sessions advertise observe-only and
+        // drop the control privilege.
+        let mut flags: u32 = 0x10 | 0x02 | (1 << 5);
+        if cfg.view_only {
+            flags = (flags & !0x02) | 0x01;
+        }
+        if let Ok(v) = std::env::var("RESTSEND_VNC_APPLE_FLAGS") {
+            if let Ok(v) = v.parse() {
+                flags = v;
+            }
+        }
+        init.extend_from_slice(&flags.to_be_bytes());
+        let clipboard = cfg.clipboard_enabled && !cfg.view_only;
+        let files = cfg.share_root.is_some() && !cfg.view_only;
+        let mut caps = apple_server_caps(clipboard, files);
+        if std::env::var_os("RESTSEND_VNC_APPLE_NO_ENC").is_some() {
+            messages::apple::clear(&mut caps, messages::apple::SET_ENCRYPTION);
         }
         init.extend_from_slice(&caps);
         init.extend_from_slice(cfg.name.as_bytes());
@@ -235,32 +241,6 @@ pub fn handle_client(
             writer_stream.as_mut(),
             cfg.share_root.is_some() && !cfg.view_only,
         )?;
-    }
-
-    // --- ARD encrypted frame channel (experimental, extended-init clients) ---
-    // First send the plaintext key/IV setup pseudo-rect, then seal every
-    // subsequent server->client message with AES-128-CBC.
-    let mut pending_setup: Option<Vec<u8>> = None;
-    let mut pending_cipher: Option<crate::rfb::apple_auth::AppleStreamCipher> = None;
-    let apple_no_enc = std::env::var_os("RESTSEND_VNC_APPLE_NO_ENC").is_some();
-    if extended && !apple_no_enc {
-        if let Some(dh) = hs.apple_key {
-            let mut key = [0u8; 16];
-            let mut iv = [0u8; 16];
-            let _ = getrandom::fill(&mut key);
-            let _ = getrandom::fill(&mut iv);
-            pending_setup = Some(crate::rfb::apple_auth::encryption_setup_message(
-                &dh, &key, &iv,
-            ));
-            let seq0: u32 = std::env::var("RESTSEND_VNC_APPLE_SEQ0")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            let reset = std::env::var_os("RESTSEND_VNC_APPLE_CBC_RESET").is_some();
-            pending_cipher = Some(
-                crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, seq0).with_iv_reset(reset),
-            );
-        }
     }
 
     // --- writer thread ---
@@ -280,8 +260,9 @@ pub fn handle_client(
     // --- shared encoder state + update pusher thread ---
     // ServerCutText is harmful to Apple clients (corrupts their protocol
     // state), so Apple sessions never receive clipboard broadcasts — they
-    // sync their clipboard via type-16 pushes instead.
-    let apple_client = hs.minor == 889;
+    // sync their clipboard through the encrypted ARD control channel.
+    let apple_client = hs.minor == 889 || hs.client_init & 0x80 != 0;
+    let apple_ready = Arc::new(AtomicBool::new(false));
     let client_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let enc: Arc<Mutex<EncState>> = Arc::new(Mutex::new(EncState {
         encodings: Vec::new(),
@@ -338,10 +319,17 @@ pub fn handle_client(
         // The hub speaks raw bytes; forward them into the writer channel.
         let (clip_tx, clip_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
         let fwd = tx.clone();
+        let ready = Arc::clone(&apple_ready);
         std::thread::Builder::new()
             .name("restsend-vnc-clip-fwd".into())
             .spawn(move || {
                 while let Ok(v) = clip_rx.recv() {
+                    // ARD notifications are only meaningful once the client
+                    // switched its stream to the record layer; before that
+                    // they would be plaintext control messages.
+                    if apple_client && !ready.load(Ordering::Acquire) {
+                        continue;
+                    }
                     if fwd.send(OutMsg::Data(v)).is_err() {
                         break;
                     }
@@ -364,17 +352,13 @@ pub fn handle_client(
         tx,
         queue_depth: Arc::clone(&queue_depth),
         session_id,
+        apple_client,
         apple_key: hs.apple_key,
-        apple_seq: Arc::new(std::sync::atomic::AtomicU32::new(
-            std::env::var("RESTSEND_VNC_APPLE_SEQ")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
-        )),
-        apple_info_sent: false,
+        apple_record_key: None,
+        apple_record_iv: None,
+        apple_started: false,
+        apple_ready: Arc::clone(&apple_ready),
         apple_auto_cmd: None,
-        pending_setup,
-        pending_cipher,
         enc: Arc::clone(&enc),
         client_ready: Arc::clone(&client_ready),
         screen_dims: (w as u32, h as u32),
@@ -385,31 +369,6 @@ pub fn handle_client(
         cheat_clicks: 0,
         cheat_at: None,
     };
-
-    // Tell Apple 3.889 viewers about the pasteboard so they enable the
-    // shared-clipboard UI. AppleVNCServer sends this when the pasteboard
-    // changes (well after startup), so delay it until the client finished
-    // its initial handshake.
-    // Apple 3.889 viewers need an AutoPasteboardInfo notification before the
-    // shared-clipboard menu items become usable. AppleVNCServer emits it as a
-    // plaintext control message (message type 20, cmd 2) while the session is
-    // still unencrypted; we do the same shortly after startup.
-    if session.apple_key.is_some() && std::env::var_os("RESTSEND_VNC_APPLE_NO_INFO").is_none() {
-        let tx = session.tx.clone();
-        let stop = Arc::clone(&session_stop);
-        std::thread::Builder::new()
-            .name("restsend-vnc-apple-info".into())
-            .spawn(move || {
-                std::thread::sleep(Duration::from_secs(1));
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                let payload = crate::rfb::apple_auth::auto_pasteboard_info(2);
-                let _ = tx.try_send(OutMsg::Data(payload.to_vec()));
-            })
-            .ok();
-    }
-    session.apple_info_sent = true;
 
     let result = match trace_path.as_ref().and_then(|p| {
         std::fs::OpenOptions::new()
@@ -496,9 +455,12 @@ fn writer_loop(
     let mut cipher: Option<crate::rfb::apple_auth::AppleStreamCipher> = None;
     while let Ok(msg) = rx.recv() {
         let ok = match msg {
-            OutMsg::Activate(c) => {
+            OutMsg::StartEncryption { setup, cipher: c } => {
+                // The 1103 rect itself travels plaintext; every following
+                // message on this channel is sealed.
+                let ok = stream.write_all(&setup).is_ok();
                 cipher = Some(c);
-                true
+                ok
             }
             OutMsg::Frame(data) => {
                 tracing::trace!(
@@ -547,6 +509,35 @@ fn writer_loop(
         }
         let _ = stream.flush();
     }
+}
+
+/// Capability bitmap for the extended ARD ServerInit: bit N (MSB-first)
+/// advertises that the server accepts client message N. Keep this to messages
+/// the session parser actually understands so a 003.889 client never sends a
+/// type we would have to abort on.
+fn apple_server_caps(clipboard: bool, files: bool) -> [u8; 16] {
+    use crate::rfb::messages::apple;
+    let mut caps = [0u8; 16];
+    for command in [
+        0x00, 0x02, 0x03, 0x04, 0x05, 0x06, //
+        0x09, 0x0a, // AutoFrameBufferUpdate, SetMode
+        0x10, // encrypted input event
+        0x12, // SetEncryption
+        0x21, // ViewerInfo
+    ] {
+        apple::set(&mut caps, command);
+    }
+    if clipboard {
+        for command in [0x0b, 0x15, 0x1f] {
+            apple::set(&mut caps, command);
+        }
+    }
+    if files {
+        for command in [0x20, 0x22] {
+            apple::set(&mut caps, command);
+        }
+    }
+    caps
 }
 
 /// Tight protocol interaction capabilities sent right after ServerInit.
@@ -1255,6 +1246,36 @@ enum UpdateStatus {
     Skipped,
 }
 
+/// Reader adapter that can switch from the plaintext RFB stream to the ARD
+/// record layer mid-session (`0x12 cmd=2`). The decoder owns no reference to
+/// the underlying reader, so the borrow stays simple.
+struct ClientStream<'a, R: Read> {
+    inner: &'a mut R,
+    decoder: Option<crate::rfb::apple_auth::RecordDecoder>,
+}
+
+impl<'a, R: Read> ClientStream<'a, R> {
+    fn new(inner: &'a mut R) -> Self {
+        ClientStream {
+            inner,
+            decoder: None,
+        }
+    }
+
+    fn enable_records(&mut self, key: [u8; 16], iv: [u8; 16]) {
+        self.decoder = Some(crate::rfb::apple_auth::RecordDecoder::new(key, iv));
+    }
+}
+
+impl<R: Read> Read for ClientStream<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.decoder.as_mut() {
+            None => self.inner.read(buf),
+            Some(decoder) => decoder.read(self.inner, buf),
+        }
+    }
+}
+
 /// Session reader state (thread-local to the reader thread).
 struct Session {
     state: Arc<ScreenState>,
@@ -1264,18 +1285,20 @@ struct Session {
     queue_depth: Arc<std::sync::atomic::AtomicUsize>,
     #[allow(dead_code)]
     session_id: u64,
+    /// True for RFB 003.889 (or ClientInit 0x80) sessions.
+    apple_client: bool,
+    /// Apple 3.889: DH session key (ECB input decrypt) until the record layer
+    /// is active, then the record-layer key (the client swaps its cryptor too).
     apple_key: Option<[u8; 16]>,
-    /// Server->client control-message sequence counter (Apple 3.889 only).
-    #[allow(dead_code)]
-    apple_seq: Arc<std::sync::atomic::AtomicU32>,
-    /// Whether the initial AutoPasteboardInfo was already pushed.
-    apple_info_sent: bool,
+    /// Record-layer key/IV distributed by the plaintext 1103 setup rect.
+    apple_record_key: Option<[u8; 16]>,
+    apple_record_iv: Option<[u8; 16]>,
+    /// True once the plaintext 1103 setup rect has been queued.
+    apple_started: bool,
+    /// Set when the client switches its own stream to records (`0x12 cmd=2`).
+    apple_ready: Arc<AtomicBool>,
     /// Last auto-pasteboard command from the viewer (1 = enabled).
     apple_auto_cmd: Option<u16>,
-    /// Plaintext ARD encryption-setup rect (sent on first SetEncodings).
-    pending_setup: Option<Vec<u8>>,
-    /// Cipher activated right after the setup rect has been queued.
-    pending_cipher: Option<crate::rfb::apple_auth::AppleStreamCipher>,
     enc: Arc<Mutex<EncState>>,
     client_ready: Arc<std::sync::atomic::AtomicBool>,
     screen_dims: (u32, u32),
@@ -1291,10 +1314,15 @@ struct Session {
 }
 
 impl Session {
-    fn run(&mut self, reader: &mut impl std::io::Read, peer: SocketAddr) -> std::io::Result<()> {
+    fn run(&mut self, reader: &mut impl Read, peer: SocketAddr) -> std::io::Result<()> {
         let ft_enabled = self.cfg.share_root.is_some() && !self.cfg.view_only;
+        let mut stream = ClientStream::new(reader);
         loop {
-            let msg = match messages::read_client_message(reader, ft_enabled) {
+            let msg = match messages::read_client_message(
+                &mut stream,
+                ft_enabled,
+                self.apple_client,
+            ) {
                 Ok(msg) => msg,
                 // Normal client disconnect (plain TCP reset or TLS EOF).
                 Err(e)
@@ -1309,22 +1337,66 @@ impl Session {
                 }
                 Err(e) => return Err(e),
             };
-            self.dispatch(msg, peer, reader)?;
+            if let ClientMessage::AppleSetEncryption { command, .. } = msg {
+                self.handle_set_encryption(command, &mut stream, peer)?;
+                continue;
+            }
+            self.dispatch(msg, peer, &mut stream)?;
         }
     }
 
-    /// Sends one encrypted ARD control message (AutoPasteboardInfo) to an
-    /// Apple 3.889 viewer, bumping the server->client sequence counter.
-    #[allow(dead_code)]
-    fn send_apple_control(&mut self, cmd: u8) {
-        let Some(key) = self.apple_key else { return };
-        let payload = crate::rfb::apple_auth::auto_pasteboard_info(cmd);
-        use std::sync::atomic::Ordering;
-        let seq = self.apple_seq.fetch_add(1, Ordering::Relaxed);
-        let msg = crate::rfb::apple_auth::encrypt_server_message(&key, seq, &payload);
-        if let Err(e) = self.tx.try_send(OutMsg::Data(msg)) {
-            tracing::debug!("apple control send failed: {e}");
+    /// Handles Apple's `0x12 SetEncryption`: command 1 requests the record
+    /// layer (server replies with the plaintext 1103 setup rect and switches
+    /// its writer); command 2 is the client's "streams are switching now"
+    /// marker, so the reader switches as well.
+    fn handle_set_encryption<R: Read>(
+        &mut self,
+        command: u16,
+        stream: &mut ClientStream<'_, R>,
+        peer: SocketAddr,
+    ) -> std::io::Result<()> {
+        tracing::info!("{peer}: Apple SetEncryption cmd={command}");
+        match command {
+            1 => self.start_apple_encryption(peer)?,
+            2 => {
+                self.start_apple_encryption(peer)?;
+                if let (Some(key), Some(iv)) = (self.apple_record_key, self.apple_record_iv) {
+                    stream.enable_records(key, iv);
+                    // The client replaces its ECB input cryptor with the
+                    // record-layer key when it sends this marker.
+                    self.apple_key = Some(key);
+                    self.apple_ready.store(true, Ordering::Release);
+                    tracing::info!("{peer}: ARD record layer active (client -> server)");
+                }
+            }
+            _ => {}
         }
+        Ok(())
+    }
+
+    /// Sends the plaintext 1103 key/IV setup and switches the writer to the
+    /// ARD record layer. Idempotent; called on cmd=1 and as a fallback on cmd=2.
+    fn start_apple_encryption(&mut self, peer: SocketAddr) -> std::io::Result<()> {
+        if self.apple_started || !self.apple_client {
+            return Ok(());
+        }
+        let Some(dh_key) = self.apple_key else {
+            return Ok(());
+        };
+        let mut key = [0u8; 16];
+        let mut iv = [0u8; 16];
+        getrandom::fill(&mut key).map_err(|e| std::io::Error::other(e.to_string()))?;
+        getrandom::fill(&mut iv).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let setup = crate::rfb::apple_auth::encryption_setup_message(&dh_key, &key, &iv);
+        self.queue(OutMsg::StartEncryption {
+            setup,
+            cipher: crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, 0),
+        })?;
+        self.apple_record_key = Some(key);
+        self.apple_record_iv = Some(iv);
+        self.apple_started = true;
+        tracing::info!("{peer}: ARD 1103 rekey sent; server -> client records active");
+        Ok(())
     }
 
     fn dispatch(
@@ -1366,14 +1438,6 @@ impl Session {
                     rich,
                     pos
                 );
-                // ARD encrypted frame channel: the setup rect must follow the
-                // client's first SetEncodings; encryption starts right after.
-                if let Some(setup) = self.pending_setup.take() {
-                    let _ = self.tx.try_send(OutMsg::Data(setup));
-                }
-                if let Some(cipher) = self.pending_cipher.take() {
-                    let _ = self.tx.try_send(OutMsg::Activate(cipher));
-                }
                 // Client finished negotiating encodings: the pusher may now
                 // start sending frames (Apple clients wait for server-push).
                 use std::sync::atomic::Ordering;
@@ -1402,19 +1466,62 @@ impl Session {
                 }
             }
             ClientMessage::AppleSession => {
-                tracing::debug!("{peer}: Apple session-start message (ignored)");
+                tracing::trace!("{peer}: Apple session/auto-update message (ignored)");
             }
             ClientMessage::AppleViewerInfo(p) => {
                 let hex: String = p.iter().take(16).map(|b| format!("{b:02x}")).collect();
                 tracing::debug!("{peer}: Apple viewer info ({} bytes) head=[{hex}]", p.len());
             }
-            ClientMessage::AppleAutoPasteboard(p) => {
-                let cmd = u16::from_be_bytes([p[2], p[3]]);
-                tracing::info!(
-                    "{peer}: Apple auto-pasteboard command cmd={cmd} raw=[{}]",
-                    p.iter().map(|b| format!("{b:02x}")).collect::<String>()
-                );
+            ClientMessage::AppleAutoPasteboard(cmd) => {
+                tracing::info!("{peer}: Apple auto-pasteboard cmd={cmd} (1=enable 2=disable)");
                 self.apple_auto_cmd = Some(cmd);
+            }
+            ClientMessage::AppleClipboardFetch { echo } => {
+                tracing::debug!("{peer}: Apple pasteboard fetch echo={echo}");
+            }
+            ClientMessage::AppleClipboardSend {
+                promise,
+                echo,
+                uncompressed,
+                compressed,
+                data,
+            } => {
+                tracing::info!(
+                    "{peer}: Apple pasteboard push (promise={promise}, echo={echo}, \
+                     {} of {compressed} compressed / {uncompressed} raw bytes)",
+                    data.len()
+                );
+            }
+            ClientMessage::AppleDrag {
+                id,
+                uncompressed,
+                compressed,
+                data,
+            } => {
+                tracing::info!(
+                    "{peer}: Apple drag id={id} ({} of {compressed} compressed / {uncompressed} raw bytes)",
+                    data.len()
+                );
+            }
+            ClientMessage::AppleFileCopy {
+                version,
+                command,
+                session,
+                body,
+            } => {
+                tracing::debug!(
+                    "{peer}: Apple file-copy v{version} cmd={command} session={session} \
+                     body={} bytes",
+                    body.len()
+                );
+            }
+            ClientMessage::AppleIgnored(kind) => {
+                tracing::trace!("{peer}: Apple message 0x{kind:02x} ignored");
+            }
+            ClientMessage::AppleSetEncryption { command, .. } => {
+                // Normally handled before dispatch so the reader can switch
+                // to the record layer; keep this arm for exhaustiveness.
+                tracing::trace!("{peer}: Apple SetEncryption cmd={command} (already handled)");
             }
             ClientMessage::AppleEncrypted { subtype, block } => {
                 let mut plain = block;
@@ -1571,7 +1678,13 @@ impl Session {
     /// Queues wire bytes for the writer thread. Blocks (up to SEND_TIMEOUT)
     /// while the client is not consuming, then gives up.
     fn send(&self, msg: Vec<u8>) -> std::io::Result<()> {
-        let mut slot = Some(OutMsg::Data(msg));
+        self.queue(OutMsg::Data(msg))
+    }
+
+    /// Queues any writer message, blocking (up to SEND_TIMEOUT) while the
+    /// channel is full so ordering is preserved.
+    fn queue(&self, msg: OutMsg) -> std::io::Result<()> {
+        let mut slot = Some(msg);
         let deadline = Instant::now() + SEND_TIMEOUT;
         loop {
             match self.tx.try_send(slot.take().expect("send slot occupied")) {
