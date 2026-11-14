@@ -105,13 +105,9 @@ impl ClipboardHub {
 }
 
 fn watcher(hub: Arc<ClipboardHub>) {
-    let Ok(mut clipboard) = arboard::Clipboard::new() else {
-        tracing::warn!("clipboard unavailable, ServerCutText disabled");
-        return;
-    };
     loop {
         std::thread::sleep(Duration::from_millis(500));
-        let Ok(text) = clipboard.get_text() else {
+        let Some(text) = get_clipboard_text() else {
             continue; // non-text content on clipboard
         };
         if text.is_empty() {
@@ -136,10 +132,26 @@ fn watcher(hub: Arc<ClipboardHub>) {
 
 /// Sets the host clipboard (used on ClientCutText). Errors are logged.
 pub fn set_clipboard(text: &str) {
+    // Integration-test hook: keep the clipboard in a file on headless hosts.
+    if let Some(path) = std::env::var_os("RESTSEND_VNC_CLIPBOARD_FILE") {
+        if let Err(e) = std::fs::write(&path, text) {
+            tracing::warn!("failed to write clipboard test file: {e}");
+        }
+        return;
+    }
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_string())) {
         Ok(()) => {}
         Err(e) => tracing::warn!("failed to set host clipboard: {e}"),
     }
+}
+
+/// Reads the current host clipboard text (used to answer an ARD pasteboard
+/// fetch). Returns `None` when the clipboard holds no text or is unavailable.
+pub fn get_clipboard_text() -> Option<String> {
+    if let Some(path) = std::env::var_os("RESTSEND_VNC_CLIPBOARD_FILE") {
+        return std::fs::read_to_string(path).ok();
+    }
+    arboard::Clipboard::new().ok()?.get_text().ok()
 }
 
 #[cfg(test)]

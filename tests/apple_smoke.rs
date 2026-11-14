@@ -91,6 +91,71 @@ fn aes_ecb_decrypt_block(key: &[u8; 16], block: &mut [u8; 16]) {
     cipher.decrypt_block(block.into());
 }
 
+fn text_archive(text: &str) -> Vec<u8> {
+    let uti = b"public.utf8-plain-text";
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&1u32.to_be_bytes());
+    archive.extend_from_slice(&(uti.len() as u32).to_be_bytes());
+    archive.extend_from_slice(uti);
+    archive.extend_from_slice(&0u32.to_be_bytes());
+    archive.extend_from_slice(&0u32.to_be_bytes());
+    archive.extend_from_slice(&(text.len() as u32).to_be_bytes());
+    archive.extend_from_slice(text.as_bytes());
+    archive
+}
+
+fn parse_text_archive(archive: &[u8]) -> Option<String> {
+    struct Rd<'a> {
+        d: &'a [u8],
+        p: usize,
+    }
+    impl Rd<'_> {
+        fn u32(&mut self) -> Option<u32> {
+            let v = u32::from_be_bytes(self.d.get(self.p..self.p + 4)?.try_into().ok()?);
+            self.p += 4;
+            Some(v)
+        }
+        fn blob(&mut self) -> Option<Vec<u8>> {
+            let len = self.u32()? as usize;
+            let bytes = self.d.get(self.p..self.p + len)?.to_vec();
+            self.p += len;
+            Some(bytes)
+        }
+    }
+    let mut rd = Rd { d: archive, p: 0 };
+    let flavors = rd.u32()?;
+    for _ in 0..flavors {
+        let uti = String::from_utf8_lossy(&rd.blob()?).into_owned();
+        let _reserved = rd.u32()?;
+        let tags = rd.u32()?;
+        for _ in 0..tags {
+            let _ = rd.blob()?;
+            let _ = rd.blob()?;
+        }
+        let data = rd.blob()?;
+        if uti == "public.utf8-plain-text" {
+            return Some(String::from_utf8_lossy(&data).into_owned());
+        }
+    }
+    None
+}
+
+fn zlib(data: &[u8]) -> Vec<u8> {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn inflate(data: &[u8], expected: usize) -> Vec<u8> {
+    use flate2::{Decompress, FlushDecompress};
+    let mut decoder = Decompress::new(true);
+    let mut out = Vec::with_capacity(expected);
+    let _ = decoder.decompress_vec(data, &mut out, FlushDecompress::Finish);
+    out
+}
+
 fn cbc_encrypt(key: &[u8; 16], iv: &mut [u8; 16], data: &mut [u8]) {
     for block in data.as_chunks_mut::<16>().0 {
         for (b, v) in block.iter_mut().zip(iv.iter()) {
@@ -202,12 +267,17 @@ fn apple_dh(s: &mut TcpStream) -> [u8; 16] {
 #[test]
 fn apple_session_starts_encrypted_record_layer() {
     let port = free_port();
+    let clip_file = std::env::temp_dir().join(format!(
+        "restsend-vnc-apple-clip-{}-{}.txt",
+        std::process::id(),
+        port
+    ));
+    std::fs::write(&clip_file, "from the windows host").unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_restsend-vnc"))
         .args([
             "--test-pattern",
             "--no-auth",
             "--no-confirm",
-            "--no-clipboard",
             "--allow-cidrs",
             "127.0.0.1/32",
             "--host",
@@ -216,6 +286,7 @@ fn apple_session_starts_encrypted_record_layer() {
             &port.to_string(),
         ])
         .env("RESTSEND_VNC_ALLOW_MULTIPLE", "1")
+        .env("RESTSEND_VNC_CLIPBOARD_FILE", &clip_file)
         .env("RUST_LOG", "restsend_vnc=info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -294,7 +365,65 @@ fn apple_session_starts_encrypted_record_layer() {
     let mut dec_iv = enc_iv;
     let mut dec_seq = 0u32;
 
-    // The first encrypted message is the second SetEncodings.
+    // --- clipboard: server -> client ---
+    // Enable shared pasteboard (0x15 selector 1) and fetch with echo 42.
+    // No SetEncodings yet: the pusher waits for it, so no framebuffer records
+    // can interleave with the clipboard reply.
+    s.write_all(&enc.seal(&[0x15, 0, 0, 1, 0, 0, 0, 0])).unwrap();
+    let mut fetch = vec![0x0bu8, 0, 0, 0];
+    fetch.extend_from_slice(&42u32.to_be_bytes());
+    s.write_all(&enc.seal(&fetch)).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut fetched = None;
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.is_empty() {
+            continue;
+        }
+        match body[0] {
+            0x1f => {
+                assert!(body.len() >= 16);
+                assert_eq!(u32::from_be_bytes(body[4..8].try_into().unwrap()), 42);
+                let uncompressed = u32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
+                let compressed = u32::from_be_bytes(body[12..16].try_into().unwrap()) as usize;
+                assert_eq!(body.len(), 16 + compressed);
+                let archive = inflate(&body[16..], uncompressed);
+                fetched = parse_text_archive(&archive);
+                break;
+            }
+            0x00 | 0x03 | 0x14 => continue,
+            other => panic!("unexpected record body type {other:#04x}"),
+        }
+    }
+    assert_eq!(
+        fetched.as_deref(),
+        Some("from the windows host"),
+        "server clipboard reply"
+    );
+
+    // --- clipboard: client -> server ---
+    let archive = text_archive("from the mac");
+    let compressed = zlib(&archive);
+    let mut send = vec![0x1fu8, 0, 0, 0];
+    send.extend_from_slice(&0u32.to_be_bytes()); // echo
+    send.extend_from_slice(&(archive.len() as u32).to_be_bytes());
+    send.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    send.extend_from_slice(&compressed);
+    s.write_all(&enc.seal(&send)).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut applied = false;
+    while Instant::now() < deadline {
+        if std::fs::read_to_string(&clip_file).is_ok_and(|text| text == "from the mac") {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(applied, "client pasteboard did not reach the host clipboard");
+
+    // --- framebuffer: negotiate encodings and wait for a pushed update ---
     let mut set_encodings = vec![2u8, 0];
     let encodings: [i32; 3] = [16, 0, -239];
     set_encodings.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
@@ -303,8 +432,6 @@ fn apple_session_starts_encrypted_record_layer() {
     }
     s.write_all(&enc.seal(&set_encodings)).unwrap();
 
-    // The pusher now free-runs. Read records until a FramebufferUpdate body
-    // arrives (control messages such as 0x14 may interleave).
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut saw_update = false;
     while Instant::now() < deadline {

@@ -6,6 +6,7 @@ pub mod filetransfer;
 pub mod handshake;
 pub mod keysym;
 pub mod messages;
+pub mod pasteboard;
 pub mod pixel;
 pub mod security;
 pub mod vencrypt;

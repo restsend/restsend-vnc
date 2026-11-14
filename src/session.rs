@@ -263,6 +263,7 @@ pub fn handle_client(
     // sync their clipboard through the encrypted ARD control channel.
     let apple_client = hs.minor == 889 || hs.client_init & 0x80 != 0;
     let apple_ready = Arc::new(AtomicBool::new(false));
+    let apple_pasteboard = Arc::new(AtomicBool::new(false));
     let client_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let enc: Arc<Mutex<EncState>> = Arc::new(Mutex::new(EncState {
         encodings: Vec::new(),
@@ -320,14 +321,16 @@ pub fn handle_client(
         let (clip_tx, clip_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
         let fwd = tx.clone();
         let ready = Arc::clone(&apple_ready);
+        let enabled = Arc::clone(&apple_pasteboard);
         std::thread::Builder::new()
             .name("restsend-vnc-clip-fwd".into())
             .spawn(move || {
                 while let Ok(v) = clip_rx.recv() {
                     // ARD notifications are only meaningful once the client
-                    // switched its stream to the record layer; before that
-                    // they would be plaintext control messages.
-                    if apple_client && !ready.load(Ordering::Acquire) {
+                    // switched its stream to the record layer and enabled
+                    // its shared pasteboard.
+                    if apple_client && !(ready.load(Ordering::Acquire) && enabled.load(Ordering::Acquire))
+                    {
                         continue;
                     }
                     if fwd.send(OutMsg::Data(v)).is_err() {
@@ -358,6 +361,7 @@ pub fn handle_client(
         apple_record_iv: None,
         apple_started: false,
         apple_ready: Arc::clone(&apple_ready),
+        apple_pasteboard,
         apple_auto_cmd: None,
         enc: Arc::clone(&enc),
         client_ready: Arc::clone(&client_ready),
@@ -1297,6 +1301,8 @@ struct Session {
     apple_started: bool,
     /// Set when the client switches its own stream to records (`0x12 cmd=2`).
     apple_ready: Arc<AtomicBool>,
+    /// Set by `0x15` selector 1: the viewer enabled shared pasteboard.
+    apple_pasteboard: Arc<AtomicBool>,
     /// Last auto-pasteboard command from the viewer (1 = enabled).
     apple_auto_cmd: Option<u16>,
     enc: Arc<Mutex<EncState>>,
@@ -1342,6 +1348,14 @@ impl Session {
                 continue;
             }
             self.dispatch(msg, peer, &mut stream)?;
+        }
+    }
+
+    /// Sends one ARD MiscStatus notification (type 0x14). The writer seals it
+    /// once the record layer is active.
+    fn send_apple_status(&self, cmd: u8) {
+        if let Err(e) = self.send(crate::rfb::apple_auth::auto_pasteboard_info(cmd).to_vec()) {
+            tracing::warn!("ARD status {cmd} send failed: {e}");
         }
     }
 
@@ -1414,10 +1428,9 @@ impl Session {
                 tracing::debug!("{peer}: encodings -> {:?}", encodings);
                 {
                     let mut st = self.enc.lock().unwrap();
-                    // Escape hatch for clients that advertise the pseudo-
-                    // encoding but do not actually draw the local cursor.
                     let force_server = std::env::var_os("RESTSEND_VNC_CURSOR_SERVER").is_some();
-                    st.cursor_rich = !force_server && encodings.contains(&pseudo::RICH_CURSOR);
+                    st.cursor_rich =
+                        use_client_cursor(self.apple_client, force_server, &encodings);
                     // The viewer already knows where its own pointer is.
                     // Echoing PointerPos at 60 Hz is redundant and some
                     // clients repaint badly when it interleaves with frame
@@ -1433,10 +1446,11 @@ impl Session {
                 let mode = if rich { "client" } else { "composited" };
                 self.state.set_cursor_mode(mode);
                 tracing::info!(
-                    "{peer}: cursor mode = {} (rich={} pointer-pos={})",
+                    "{peer}: cursor mode = {} (rich={} pointer-pos={} apple={})",
                     mode,
                     rich,
-                    pos
+                    pos,
+                    self.apple_client
                 );
                 // Client finished negotiating encodings: the pusher may now
                 // start sending frames (Apple clients wait for server-push).
@@ -1475,9 +1489,24 @@ impl Session {
             ClientMessage::AppleAutoPasteboard(cmd) => {
                 tracing::info!("{peer}: Apple auto-pasteboard cmd={cmd} (1=enable 2=disable)");
                 self.apple_auto_cmd = Some(cmd);
+                self.apple_pasteboard
+                    .store(cmd == 1, Ordering::Release);
             }
             ClientMessage::AppleClipboardFetch { echo } => {
-                tracing::debug!("{peer}: Apple pasteboard fetch echo={echo}");
+                if !self.cfg.clipboard_enabled || self.cfg.view_only {
+                    return Ok(());
+                }
+                let text = crate::clipboard::get_clipboard_text();
+                tracing::debug!(
+                    "{peer}: Apple pasteboard fetch echo={echo} ({} bytes)",
+                    text.as_deref().map(str::len).unwrap_or(0)
+                );
+                match crate::rfb::pasteboard::message(text.as_deref(), echo) {
+                    Ok(msg) => {
+                        self.send(msg)?;
+                    }
+                    Err(e) => tracing::warn!("{peer}: cannot build pasteboard reply: {e}"),
+                }
             }
             ClientMessage::AppleClipboardSend {
                 promise,
@@ -1486,11 +1515,35 @@ impl Session {
                 compressed,
                 data,
             } => {
-                tracing::info!(
-                    "{peer}: Apple pasteboard push (promise={promise}, echo={echo}, \
-                     {} of {compressed} compressed / {uncompressed} raw bytes)",
-                    data.len()
-                );
+                if !self.cfg.clipboard_enabled || self.cfg.view_only {
+                    return Ok(());
+                }
+                if data.len() != compressed as usize {
+                    tracing::warn!(
+                        "{peer}: Apple pasteboard truncated ({} of {compressed} bytes); ignored",
+                        data.len()
+                    );
+                    return Ok(());
+                }
+                if promise {
+                    tracing::debug!("{peer}: Apple pasteboard is a promise; requesting data");
+                    self.send_apple_status(3);
+                    return Ok(());
+                }
+                match crate::rfb::pasteboard::text_from_message(&data, uncompressed) {
+                    Some(text) if !text.is_empty() => {
+                        tracing::debug!(
+                            "{peer}: Apple pasteboard set host clipboard ({} bytes)",
+                            text.len()
+                        );
+                        self.hub.mark_local(&text);
+                        crate::clipboard::set_clipboard(&text);
+                    }
+                    Some(_) => {}
+                    None => tracing::debug!(
+                        "{peer}: Apple pasteboard has no text flavor (echo={echo}, {uncompressed} bytes)"
+                    ),
+                }
             }
             ClientMessage::AppleDrag {
                 id,
