@@ -21,8 +21,8 @@ use flate2::Compress;
 
 use crate::clipboard::ClipboardHub;
 use crate::cursor::{
-    cursor_rect, hidden_cursor_message, overlay_frame, pointer_pos_message, rich_cursor_message,
-    CursorSnapshot,
+    cursor_alpha_message, cursor_rect, hidden_cursor_message, overlay_frame, pointer_pos_message,
+    rich_cursor_message, CursorSnapshot,
 };
 use crate::diff::{diff_tiles, Rect};
 use crate::encode::{encode_rect, Encoding};
@@ -37,11 +37,6 @@ use crate::throttle::{cursor_interval, ByteBudget};
 /// Hard cap on the wire bytes of one framebuffer update. The time budget
 /// below is the primary limiter; this only prevents pathological messages.
 const MAX_UPDATE_BYTES: usize = 2 << 20;
-/// Apple Screen Sharing treats each ARD record body as one RFB message, so an
-/// encrypted framebuffer update must fit in a single record (<= 65498 bytes).
-/// Keep a margin for the FBU and rectangle headers.
-const APPLE_UPDATE_BYTES: usize = 60 << 10;
-const APPLE_RECT_RAW: usize = APPLE_UPDATE_BYTES - 1024;
 /// Bytes allowed to be queued/in flight before the pusher stops encoding.
 /// Keeping roughly one 4K update in flight bounds latency without starving
 /// the link. Larger than one max update so a burst can drain.
@@ -53,6 +48,12 @@ const MAX_UPDATE_BUDGET: Duration = Duration::from_millis(25);
 /// video) are encoded as horizontal strips so one encode never blocks the
 /// stream for hundreds of milliseconds.
 const MAX_RECT_RAW: usize = 2 << 20;
+/// Apple sessions send one complete FramebufferUpdate per captured frame (the
+/// ARD record layer splits it into records and the viewer reassembles it).
+/// Strips would render progressively and look torn during drags/games.
+const APPLE_UPDATE_BYTES: usize = 48 << 20;
+const APPLE_RECT_RAW: usize = 48 << 20;
+const APPLE_FRAME_QUEUE_LIMIT: usize = 192 << 20;
 const DOWNLOAD_CHUNK: usize = 8192;
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound the RFB/TLS handshake so a slow or silent client cannot pin a
@@ -249,9 +250,14 @@ pub fn handle_client(
     }
 
     // --- writer thread ---
+    let apple_client = hs.minor == 889 || hs.client_init & 0x80 != 0;
     let (tx, rx) = std::sync::mpsc::sync_channel::<OutMsg>(64);
     let queue_depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let frame_budget = Arc::new(ByteBudget::new(FRAME_QUEUE_LIMIT));
+    let frame_budget = Arc::new(ByteBudget::new(if apple_client {
+        APPLE_FRAME_QUEUE_LIMIT
+    } else {
+        FRAME_QUEUE_LIMIT
+    }));
     let session_stop = Arc::new(AtomicBool::new(false));
     let writer_thread = std::thread::Builder::new()
         .name("restsend-vnc-session-writer".into())
@@ -266,15 +272,17 @@ pub fn handle_client(
     // ServerCutText is harmful to Apple clients (corrupts their protocol
     // state), so Apple sessions never receive clipboard broadcasts — they
     // sync their clipboard through the encrypted ARD control channel.
-    let apple_client = hs.minor == 889 || hs.client_init & 0x80 != 0;
     let apple_ready = Arc::new(AtomicBool::new(false));
     let apple_pasteboard = Arc::new(AtomicBool::new(false));
+    let viewer_scale = Arc::new(std::sync::atomic::AtomicU32::new(1.0f32.to_bits()));
+    let force_full = Arc::new(AtomicBool::new(false));
     let client_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let enc: Arc<Mutex<EncState>> = Arc::new(Mutex::new(EncState {
         encodings: Vec::new(),
         encoder: PixelEncoder::new(pf),
         cursor_rich: false,
         cursor_pos: false,
+        cursor_alpha: false,
     }));
     // Every client is server-push fed: the pusher thread publishes
     // incremental updates at the configured fps. (Apple 3.889 clients send
@@ -313,10 +321,13 @@ pub fn handle_client(
         } else {
             MAX_RECT_RAW
         },
+        viewer_scale: Arc::clone(&viewer_scale),
+        force_full: Arc::clone(&force_full),
         last_frame_gen: u64::MAX,
-        cursor_shape_serial_sent: 0,
+        cursor_shape_serial_sent: u64::MAX,
         cursor_pos_sent: (u16::MAX, u16::MAX),
         cursor_visible_sent: false,
+        cursor_hidden_sent: false,
         cursor_gen_sent: u64::MAX,
         cursor_bbox_sent: None,
         cursor_need_repaint: false,
@@ -378,6 +389,9 @@ pub fn handle_client(
         apple_started: false,
         apple_ready: Arc::clone(&apple_ready),
         apple_display_sent: false,
+        last_layout_at: None,
+        viewer_scale: 1.0,
+        force_full: Arc::clone(&force_full),
         apple_pasteboard,
         apple_auto_cmd: None,
         ard_upload: None,
@@ -473,14 +487,70 @@ fn apple_keysym_target(keysym: u32) -> u32 {
 /// Chooses between the client-side (Rich Cursor) and server-composited
 /// cursor.
 ///
-/// Apple's Screen Sharing advertises the Rich Cursor pseudo-encoding but does
-/// not reliably draw the shape it receives, and macOS hides the local pointer
-/// while typing — both leave the viewer with no visible pointer. Apple/ARD
-/// sessions therefore always get the server-composited cursor, which is part
-/// of the framebuffer and cannot be hidden by the client. `force_server`
-/// (`RESTSEND_VNC_CURSOR_SERVER`) overrides the choice for other clients.
+/// Other viewers draw the Rich Cursor locally, which costs no traffic.
+/// Screen Sharing gets the server-composited overlay instead: its macOS client
+/// leaves old cursors behind when full-frame updates are pushed quickly.
+/// `RESTSEND_VNC_CURSOR_SERVER` forces the overlay for any other viewer.
 fn use_client_cursor(composited_apple: bool, force_server: bool, encodings: &[i32]) -> bool {
+    // Screen Sharing advertises Rich Cursor but its macOS client leaves a
+    // trail of old cursors when the server pushes full-frame updates. Keep
+    // encrypted Apple sessions on the server-composited pointer, which the
+    // server can erase deterministically. The plaintext diagnostic path
+    // (`RESTSEND_VNC_APPLE_NO_EXT`) and other viewers keep the client cursor.
     !composited_apple && !force_server && encodings.contains(&pseudo::RICH_CURSOR)
+}
+
+/// When the server draws the pointer itself, tell clients that support it to
+/// hide their local pointer. Without this Screen Sharing keeps its native
+/// cursor on top of the composited one and that local cursor trails.
+fn hide_local_cursor(rich: bool, alpha: bool, encodings: &[i32]) -> bool {
+    !rich && !alpha && encodings.contains(&pseudo::RICH_CURSOR)
+}
+
+/// Grows a rect by `margin` pixels on every side, clamped to the framebuffer.
+fn expand_rect(rect: Rect, margin: u16, width: u32, height: u32) -> Option<Rect> {
+    let x = rect.x.saturating_sub(margin) as u32;
+    let y = rect.y.saturating_sub(margin) as u32;
+    let right = (rect.x as u32 + rect.w as u32 + margin as u32).min(width);
+    let bottom = (rect.y as u32 + rect.h as u32 + margin as u32).min(height);
+    if right <= x || bottom <= y {
+        return None;
+    }
+    Some(Rect::new(
+        x as u16,
+        y as u16,
+        (right - x) as u16,
+        (bottom - y) as u16,
+    ))
+}
+
+/// Encoding time allowed for one update. Apple sessions must finish the whole
+/// frame in one FBU; deferring rects sends a partial desktop and looks torn.
+fn encode_budget(whole_frame: bool, incremental: bool, frame_interval: Duration) -> Duration {
+    if whole_frame {
+        Duration::from_secs(2)
+    } else if incremental {
+        // Leave headroom for the cursor overlay and the next tick, but let a
+        // 30 fps session spend ~23 ms encoding so window drags complete in
+        // one or two updates instead of many thin bands.
+        frame_interval
+            .mul_f32(0.7)
+            .clamp(Duration::from_millis(8), MAX_UPDATE_BUDGET)
+    } else {
+        Duration::from_millis(150)
+    }
+}
+
+/// Maps a pointer position from the (possibly scaled) viewer framebuffer back
+/// to native framebuffer coordinates.
+fn native_pointer(x: u16, y: u16, scale: f32, dims: (u32, u32)) -> (u16, u16) {
+    let scale = scale.clamp(0.1, 1.0);
+    if scale >= 0.999 {
+        return (x, y);
+    }
+    let nx = ((x as f32 / scale).round() as u32).min(dims.0.saturating_sub(1)) as u16;
+    let ny = ((y as f32 / scale).round() as u32).min(dims.1.saturating_sub(1)) as u16;
+    (nx, ny)
 }
 
 fn writer_loop(
@@ -551,25 +621,31 @@ fn writer_loop(
 /// ARD AppleDisplayLayout pseudo-rect (encoding 1105). Screen Sharing uses
 /// this to size its framebuffer/decoder before the first pixel update; without
 /// it the codecs reject the first frame ("unexpected frame update").
-fn apple_display_layout_message(width: u16, height: u16) -> Vec<u8> {
+fn apple_display_layout_message(
+    desktop_w: u16,
+    desktop_h: u16,
+    fb_w: u16,
+    fb_h: u16,
+    scale: f32,
+) -> Vec<u8> {
     let mut body = Vec::with_capacity(0x14 + 0x38 + 2);
     body.extend_from_slice(&5u16.to_be_bytes()); // version
-    body.extend_from_slice(&width.to_be_bytes()); // desktop (points)
-    body.extend_from_slice(&height.to_be_bytes());
-    body.extend_from_slice(&width.to_be_bytes()); // framebuffer (pixels)
-    body.extend_from_slice(&height.to_be_bytes());
+    body.extend_from_slice(&desktop_w.to_be_bytes()); // desktop (points)
+    body.extend_from_slice(&desktop_h.to_be_bytes());
+    body.extend_from_slice(&fb_w.to_be_bytes()); // framebuffer (pixels)
+    body.extend_from_slice(&fb_h.to_be_bytes());
     body.extend_from_slice(&0xffff_ffffu32.to_be_bytes()); // all displays
     body.extend_from_slice(&4u32.to_be_bytes()); // session state: on console
     body.extend_from_slice(&1u16.to_be_bytes()); // display count
     body.extend_from_slice(&1.0f64.to_be_bytes()); // density
-    body.extend_from_slice(&1.0f64.to_be_bytes()); // scale
+    body.extend_from_slice(&(scale as f64).to_be_bytes()); // viewer scale
     body.extend_from_slice(&1u32.to_be_bytes()); // display id
-    for _ in 0..2 {
-        // logical rect (top, left, bottom, right), then backing rect
+    for (w, h) in [(desktop_w, desktop_h), (fb_w, fb_h)] {
+        // logical (point) rect, then backing (pixel) rect
         body.extend_from_slice(&0u16.to_be_bytes());
         body.extend_from_slice(&0u16.to_be_bytes());
-        body.extend_from_slice(&height.to_be_bytes());
-        body.extend_from_slice(&width.to_be_bytes());
+        body.extend_from_slice(&h.to_be_bytes());
+        body.extend_from_slice(&w.to_be_bytes());
     }
     body.extend_from_slice(&1u32.to_be_bytes()); // main display
     PixelFormat::native().write(&mut body);
@@ -694,6 +770,8 @@ struct EncState {
     cursor_rich: bool,
     /// Client advertised the PointerPos pseudo-encoding (-232).
     cursor_pos: bool,
+    /// Client advertised Apple's CursorAlpha pseudo-encoding (1104).
+    cursor_alpha: bool,
 }
 
 /// Pusher thread state: owns the framebuffer-update machinery.
@@ -731,18 +809,22 @@ struct Updater {
     force_next: bool,
     /// Rects deferred by the time budget, sent first on the next tick.
     pending: Vec<Rect>,
-    /// Per-update wire cap. Apple clients get one RFB message per record, so a
-    /// framebuffer update must fit in a single record (~64 KiB).
+    /// Per-update wire cap. Apple sessions keep each FBU inside one ARD record.
     max_update_bytes: usize,
-    /// Largest raw rect to encode before splitting into strips (keeps one
-    /// rectangle's payload inside `max_update_bytes`).
+    /// Largest raw rect to encode before splitting into strips.
     max_rect_raw: usize,
+    /// Viewer-requested framebuffer scale (0.1..=1.0).
+    viewer_scale: Arc<std::sync::atomic::AtomicU32>,
+    /// Set when a layout/scale change needs a full repaint.
+    force_full: Arc<AtomicBool>,
     /// Last frame generation we pushed.
     last_frame_gen: u64,
     /// Cursor state last acknowledged by the client.
     cursor_shape_serial_sent: u64,
     cursor_pos_sent: (u16, u16),
     cursor_visible_sent: bool,
+    /// Alpha cursor: whether the hide message was already sent.
+    cursor_hidden_sent: bool,
     cursor_gen_sent: u64,
     /// Cursor bbox currently drawn by a compositing (non-pseudo) client.
     cursor_bbox_sent: Option<Rect>,
@@ -806,10 +888,28 @@ impl Updater {
         if !self.enc.lock().unwrap().encodings.is_empty() {
             tracing::debug!("pusher: starting, encodings negotiated");
         }
+        {
+            let (encodings, _, rich, _, alpha) = self.enc_state();
+            if hide_local_cursor(rich, alpha, &encodings) && !self.cursor_hidden_sent {
+                // The server draws the pointer. Hide the viewer's local one
+                // now: the record layer is active by the time the pusher is
+                // allowed to send, so this cannot race the ARD switch.
+                if let Err(e) = self.send(hidden_cursor_message()) {
+                    tracing::info!("pusher ended: {e}");
+                    return;
+                }
+                self.cursor_hidden_sent = true;
+                tracing::debug!("sent hidden local cursor");
+            }
+        }
         let mut first = true;
         loop {
             if self.state.is_stopped() || self.stop.load(Ordering::Relaxed) {
                 return;
+            }
+            if self.force_full.swap(false, Ordering::AcqRel) {
+                first = true;
+                self.force_next = true;
             }
             let frame_gen = self.state.generation();
             let cursor_gen = self.state.cursor_generation();
@@ -1021,10 +1121,18 @@ impl Updater {
             self.frame_budget.release(reserved);
             return Ok(UpdateStatus::Empty);
         }
+        // Viewer scaling: resize before diff/encode so the whole pipeline
+        // (cache, strips, cursor overlay) works in the scaled coordinate space.
+        let viewer = self.viewer_scale();
+        let current = if viewer < 0.999 {
+            Arc::new(current.resized(viewer))
+        } else {
+            current
+        };
 
         // Resolution changed since the client last saw the framebuffer?
         if current.dims() != self.client_dims {
-            let (encodings, _, _, _) = self.enc_state();
+            let (encodings, _, _, _, _) = self.enc_state();
             if encodings.contains(&pseudo::NEW_FB_SIZE) {
                 let mut msg = messages::framebuffer_update_header(1);
                 msg.extend(rect_header(
@@ -1042,13 +1150,15 @@ impl Updater {
                 self.pending.clear();
                 self.cursor_bbox_sent = None;
                 self.cursor_gen_sent = u64::MAX;
+                // The next tick must send the pixels at the new size.
+                self.force_next = true;
                 self.frame_budget.release(reserved);
                 return Ok(UpdateStatus::Empty);
             }
             // Clients without resize support just get the new-size pixels.
         }
 
-        let (encodings, encoder, _, _) = self.enc_state();
+        let (encodings, encoder, _, _, _) = self.enc_state();
         let encoding = encoding_override().unwrap_or_else(|| Encoding::pick(&encodings));
         // Deferred rects from the previous tick take priority: otherwise a
         // continuously changing screen would always re-send the top and never
@@ -1092,16 +1202,8 @@ impl Updater {
         // old 1 MB cap could take a second to drain 4K top-to-bottom).
         // The very first paint (and a resolution change) has no interactive
         // latency to protect, so allow it to finish in fewer ticks.
-        let budget = if incremental {
-            // Leave headroom for the cursor overlay and the next tick, but
-            // let a 30 fps session spend ~23 ms encoding so window drags
-            // complete in one or two updates instead of many thin bands.
-            self.frame_interval
-                .mul_f32(0.7)
-                .clamp(Duration::from_millis(8), MAX_UPDATE_BUDGET)
-        } else {
-            Duration::from_millis(150)
-        };
+        let whole_frame = self.max_update_bytes > MAX_UPDATE_BYTES;
+        let budget = encode_budget(whole_frame, incremental, self.frame_interval);
         let encode_started = Instant::now();
         let mut payloads: Vec<Vec<u8>> = Vec::new();
         let mut total: usize = 0;
@@ -1155,13 +1257,19 @@ impl Updater {
         Ok(UpdateStatus::Sent)
     }
 
-    fn enc_state(&self) -> (Vec<i32>, PixelEncoder, bool, bool) {
+    /// Current viewer-requested scale, read from the shared atomic.
+    fn viewer_scale(&self) -> f32 {
+        f32::from_bits(self.viewer_scale.load(Ordering::Acquire)).clamp(0.1, 1.0)
+    }
+
+    fn enc_state(&self) -> (Vec<i32>, PixelEncoder, bool, bool, bool) {
         let st = self.enc.lock().unwrap();
         (
             st.encodings.clone(),
             st.encoder.clone(),
             st.cursor_rich,
             st.cursor_pos,
+            st.cursor_alpha,
         )
     }
 
@@ -1169,11 +1277,40 @@ impl Updater {
     /// tiny composited overlay rectangle (all other clients). Returns false
     /// when the send budget is exhausted and the update should be retried.
     fn send_cursor(&mut self, snap: &CursorSnapshot) -> std::io::Result<bool> {
-        let (encodings, encoder, rich, pos_supported) = self.enc_state();
+        let (encodings, encoder, rich, pos_supported, alpha) = self.enc_state();
         if encodings.is_empty() {
             return Ok(true);
         }
-        let scale = self.state.scale();
+        let viewer = self.viewer_scale();
+        let scale = self.state.scale() * viewer;
+        let sx = (snap.x as f32 * viewer).round().min(u16::MAX as f32) as u16;
+        let sy = (snap.y as f32 * viewer).round().min(u16::MAX as f32) as u16;
+
+        if alpha {
+            // Apple's native cursor path (opt-in, for protocol testing). The
+            // client caches the pixmap and draws it at its own pointer.
+            let hidden = !snap.visible || snap.shape.is_none();
+            if hidden {
+                if !self.cursor_hidden_sent {
+                    self.send(hidden_cursor_message())?;
+                    self.cursor_hidden_sent = true;
+                    self.cursor_shape_serial_sent = 0;
+                }
+                return Ok(true);
+            }
+            let changed =
+                self.cursor_hidden_sent || snap.shape_serial != self.cursor_shape_serial_sent;
+            if changed {
+                if let Some(shape) = snap.shape.as_ref() {
+                    let scaled = shape.scaled(scale);
+                    let id = 1000u32.wrapping_add((snap.shape_serial & 0x7fff_ffff) as u32);
+                    self.send(cursor_alpha_message(&scaled, id))?;
+                    self.cursor_shape_serial_sent = snap.shape_serial;
+                    self.cursor_hidden_sent = false;
+                }
+            }
+            return Ok(true);
+        }
 
         if rich {
             let mut queued = false;
@@ -1202,12 +1339,12 @@ impl Updater {
                 self.dbg_bytes += estimate as u64;
                 queued = true;
             }
-            if pos_supported && (snap.x, snap.y) != self.cursor_pos_sent {
+            if pos_supported && (sx, sy) != self.cursor_pos_sent {
                 if !self.frame_budget.try_reserve(16) {
                     return Ok(false);
                 }
-                self.queue_reserved(pointer_pos_message(snap.x, snap.y), 16)?;
-                self.cursor_pos_sent = (snap.x, snap.y);
+                self.queue_reserved(pointer_pos_message(sx, sy), 16)?;
+                self.cursor_pos_sent = (sx, sy);
                 self.stats_updates += 1;
                 self.dbg_updates += 1;
                 self.dbg_bytes += 16;
@@ -1215,7 +1352,7 @@ impl Updater {
             }
             if !queued {
                 // Nothing to send; still count the state as acknowledged.
-                self.cursor_pos_sent = (snap.x, snap.y);
+                self.cursor_pos_sent = (sx, sy);
             }
             return Ok(true);
         }
@@ -1230,9 +1367,9 @@ impl Updater {
             return Ok(false);
         }
         let cur_rect = if snap.visible {
-            snap.shape.as_ref().and_then(|shape| {
-                cursor_rect(shape, snap.x, snap.y, scale, frame.width, frame.height)
-            })
+            snap.shape
+                .as_ref()
+                .and_then(|shape| cursor_rect(shape, sx, sy, scale, frame.width, frame.height))
         } else {
             None
         };
@@ -1246,7 +1383,12 @@ impl Updater {
         let mut paint: Vec<(Rect, bool)> = Vec::new();
         if let Some(old) = self.cursor_bbox_sent {
             if Some(old) != cur_rect {
-                paint.push((old, false));
+                // Give the erase rect a small margin. Cursor shadows and
+                // scaled/antialiased edges can leave a dark fringe just
+                // outside the nominal bitmap bounds.
+                if let Some(old) = expand_rect(old, 2, frame.width, frame.height) {
+                    paint.push((old, false));
+                }
             }
         }
         if let Some(cur) = cur_rect {
@@ -1375,6 +1517,12 @@ struct Session {
     apple_ready: Arc<AtomicBool>,
     /// Whether the ARD DisplayInfo pseudo-rect was queued.
     apple_display_sent: bool,
+    /// When the last layout answer was sent (throttles 0x08/0x1d replies).
+    last_layout_at: Option<Instant>,
+    /// Current viewer-requested framebuffer scale (1.0 = native).
+    viewer_scale: f32,
+    /// Set when a layout/scale change needs a full repaint.
+    force_full: Arc<AtomicBool>,
     /// Set by `0x15` selector 1: the viewer enabled shared pasteboard.
     apple_pasteboard: Arc<AtomicBool>,
     /// Last auto-pasteboard command from the viewer (1 = enabled).
@@ -1443,6 +1591,50 @@ impl Session {
         if let Err(e) = self.send(crate::rfb::apple_auth::auto_pasteboard_info(cmd).to_vec()) {
             tracing::warn!("ARD status {cmd} send failed: {e}");
         }
+    }
+
+    /// Answers a viewer scale/display request (0x08 / 0x1d) with the current
+    /// AppleDisplayLayout. Screen Sharing stops repainting after a window resize
+    /// until it receives this.
+    /// Builds the current AppleDisplayLayout for a viewer scale.
+    fn apple_layout_message(&self, scale: f32) -> Option<Vec<u8>> {
+        let (dw, dh) = self.screen_dims;
+        if dw == 0 || dh == 0 {
+            return None;
+        }
+        let scale = scale.clamp(0.1, 1.0);
+        let fw = ((dw as f32 * scale).round() as u32)
+            .max(2)
+            .min(u16::MAX as u32) as u16;
+        let fh = ((dh as f32 * scale).round() as u32)
+            .max(2)
+            .min(u16::MAX as u32) as u16;
+        Some(apple_display_layout_message(
+            dw as u16, dh as u16, fw, fh, scale,
+        ))
+    }
+
+    /// Answers a viewer scale/display request with the current
+    /// AppleDisplayLayout. Screen Sharing stops repainting after a window
+    /// resize until it receives this.
+    fn send_apple_layout(&mut self, scale: f32, throttle: bool) -> std::io::Result<()> {
+        if !self.apple_client || !self.apple_ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if throttle
+            && self
+                .last_layout_at
+                .map(|t| t.elapsed() < Duration::from_millis(500))
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        self.last_layout_at = Some(Instant::now());
+        if let Some(msg) = self.apple_layout_message(scale) {
+            self.queue(OutMsg::Data(msg))?;
+        }
+        self.force_full.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// True when the session may exchange files with the viewer.
@@ -1599,9 +1791,9 @@ impl Session {
                     self.apple_ready.store(true, Ordering::Release);
                     if !self.apple_display_sent {
                         self.apple_display_sent = true;
-                        let (w, h) = self.screen_dims;
-                        let msg = apple_display_layout_message(w as u16, h as u16);
-                        self.queue(OutMsg::Data(msg))?;
+                        if let Some(msg) = self.apple_layout_message(self.viewer_scale) {
+                            self.queue(OutMsg::Data(msg))?;
+                        }
                     }
                     // Fallback: if the viewer sends no encrypted preface,
                     // start pushing after a short grace period.
@@ -1638,8 +1830,7 @@ impl Session {
         let reset = std::env::var_os("RESTSEND_VNC_APPLE_CBC_RESET").is_some();
         self.queue(OutMsg::StartEncryption {
             setup,
-            cipher: crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, 0)
-                .with_iv_reset(reset),
+            cipher: crate::rfb::apple_auth::AppleStreamCipher::new(key, iv, 0).with_iv_reset(reset),
         })?;
         self.apple_record_key = Some(key);
         self.apple_record_iv = Some(iv);
@@ -1664,8 +1855,17 @@ impl Session {
                 {
                     let mut st = self.enc.lock().unwrap();
                     let force_server = std::env::var_os("RESTSEND_VNC_CURSOR_SERVER").is_some();
-                    st.cursor_rich =
-                        use_client_cursor(self.apple_client && self.apple_started, force_server, &encodings);
+                    // Apple's CursorAlpha is opt-in: default to the
+                    // composited overlay, which the server can erase.
+                    st.cursor_alpha = self.apple_client
+                        && encodings.contains(&1104)
+                        && std::env::var_os("RESTSEND_VNC_CURSOR_ALPHA").is_some();
+                    st.cursor_rich = !st.cursor_alpha
+                        && use_client_cursor(
+                            self.apple_client && self.apple_started,
+                            force_server,
+                            &encodings,
+                        );
                     // The viewer already knows where its own pointer is.
                     // Echoing PointerPos at 60 Hz is redundant and some
                     // clients repaint badly when it interleaves with frame
@@ -1674,17 +1874,24 @@ impl Session {
                         && std::env::var_os("RESTSEND_VNC_POINTER_POS").is_some();
                     st.encodings = encodings;
                 }
-                let (rich, pos) = {
+                let (rich, pos, alpha) = {
                     let st = self.enc.lock().unwrap();
-                    (st.cursor_rich, st.cursor_pos)
+                    (st.cursor_rich, st.cursor_pos, st.cursor_alpha)
                 };
-                let mode = if rich { "client" } else { "composited" };
+                let mode = if alpha {
+                    "alpha"
+                } else if rich {
+                    "client"
+                } else {
+                    "composited"
+                };
                 self.state.set_cursor_mode(mode);
                 tracing::info!(
-                    "{peer}: cursor mode = {} (rich={} pointer-pos={} apple={})",
+                    "{peer}: cursor mode = {} (rich={} pointer-pos={} alpha={} apple={})",
                     mode,
                     rich,
                     pos,
+                    alpha,
                     self.apple_client
                 );
                 // Client finished negotiating encodings: the pusher may now
@@ -1729,17 +1936,39 @@ impl Session {
                 tracing::info!("{peer}: Apple auto-pasteboard cmd={cmd} (1=enable 2=disable)");
                 self.apple_auto_cmd = Some(cmd);
                 self.apple_pasteboard.store(cmd == 1, Ordering::Release);
+                if cmd == 1 && self.apple_ready.load(Ordering::Acquire) {
+                    // The viewer enables sharing but only fetches on a change
+                    // notification. Give its pasteboard monitor a moment to
+                    // initialize, then prompt it once for the current host
+                    // clipboard.
+                    let tx = self.tx.clone();
+                    let ready = Arc::clone(&self.apple_ready);
+                    let enabled = Arc::clone(&self.apple_pasteboard);
+                    std::thread::Builder::new()
+                        .name("restsend-vnc-ard-clip-init".into())
+                        .spawn(move || {
+                            std::thread::sleep(Duration::from_millis(500));
+                            if ready.load(Ordering::Acquire) && enabled.load(Ordering::Acquire) {
+                                let msg = crate::rfb::apple_auth::auto_pasteboard_info(2).to_vec();
+                                let _ = tx.try_send(OutMsg::Data(msg));
+                            }
+                        })
+                        .ok();
+                }
             }
-            ClientMessage::AppleClipboardFetch { echo } => {
+            ClientMessage::AppleClipboardFetch { echo, promise } => {
                 if !self.cfg.clipboard_enabled || self.cfg.view_only {
                     return Ok(());
                 }
                 let content = crate::clipboard::get_clipboard_content().unwrap_or_default();
                 tracing::debug!(
-                    "{peer}: Apple pasteboard fetch echo={echo} ({} text bytes, {} files)",
+                    "{peer}: Apple pasteboard fetch echo={echo} promise={promise} \
+                     ({} text bytes, {} files)",
                     content.text.as_deref().map(str::len).unwrap_or(0),
                     content.files.len()
                 );
+                // Apple's own servers reply with the full archive even to a
+                // promise poll; the native client applies it directly.
                 let archive = crate::rfb::pasteboard::content_archive(
                     content.text.as_deref(),
                     &content.files,
@@ -1747,7 +1976,7 @@ impl Session {
                 if !content.files.is_empty() {
                     self.ard_offered_files = content.files.clone();
                 }
-                match crate::rfb::pasteboard::message_for_archive(&archive, echo) {
+                match crate::rfb::pasteboard::message_for_archive(&archive, echo, promise) {
                     Ok(msg) => {
                         self.send(msg)?;
                     }
@@ -1775,6 +2004,14 @@ impl Session {
                     tracing::debug!("{peer}: Apple pasteboard is a promise; requesting data");
                     self.send_apple_status(3);
                     return Ok(());
+                }
+                if let Ok(archive) = crate::rfb::pasteboard::inflate(&data, uncompressed as usize) {
+                    let head = &archive[..archive.len().min(256)];
+                    tracing::info!(
+                        "{peer}: Apple pasteboard archive ({} bytes) hex={}",
+                        archive.len(),
+                        hex::encode(head)
+                    );
                 }
                 match crate::rfb::pasteboard::text_from_message(&data, uncompressed) {
                     Some(text) if !text.is_empty() => {
@@ -1837,7 +2074,25 @@ impl Session {
                 self.handle_apple_file(peer, command, session, &body)?;
             }
             ClientMessage::AppleIgnored(kind) => {
-                tracing::trace!("{peer}: Apple message 0x{kind:02x} ignored");
+                if self.apple_client && kind == 0x1d {
+                    // SetDisplayConfiguration: the viewer resized its window
+                    // and waits for an updated layout.
+                    tracing::debug!("{peer}: Apple display config 0x{kind:02x}");
+                    self.send_apple_layout(self.viewer_scale, true)?;
+                } else {
+                    tracing::trace!("{peer}: Apple message 0x{kind:02x} ignored");
+                }
+            }
+            ClientMessage::AppleScaleFactor(value) => {
+                // The viewer wants server-side scaling. Render native and let
+                // the client scale the framebuffer locally: Screen Sharing
+                // stops reading if the server changes the geometry mid-session
+                // on some builds. A fresh layout plus a full repaint keeps the
+                // window live after a resize.
+                tracing::info!("{peer}: viewer scale request {value:.3} (native render)");
+                if self.apple_ready.load(Ordering::Acquire) {
+                    self.send_apple_layout(1.0, false)?;
+                }
             }
             ClientMessage::AppleSetEncryption { command, .. } => {
                 // Normally handled before dispatch so the reader can switch
@@ -1921,11 +2176,13 @@ impl Session {
     /// Applies a pointer position/button update (shared by standard RFB and
     /// Apple clients). `mask` follows RFB bit order.
     fn apply_pointer(&mut self, x: u16, y: u16, mask: u8) {
-        // Track the pointer in framebuffer coordinates for the composited
-        // cursor. (The WGC frame no longer contains the pointer.)
-        if !self.cfg.test_pattern {
-            self.state.set_cursor_pos(x, y);
-        }
+        // The viewer's coordinates are in the (possibly scaled) framebuffer.
+        // The composited cursor overlay is drawn in native coordinates and
+        // scaled when sent, and input injection needs native coordinates too.
+        let (nx, ny) = native_pointer(x, y, self.viewer_scale, self.screen_dims);
+        // Track the pointer in native framebuffer coordinates for the
+        // composited cursor. (The WGC frame no longer contains the pointer.)
+        self.state.set_cursor_pos(nx, ny);
         // Hidden shortcut: hold Ctrl and left-click 3 times (within 2s) to
         // toggle the debug overlay.
         let left_pressed = mask & 1 != 0 && self.last_mask & 1 == 0;
@@ -1961,11 +2218,11 @@ impl Session {
             }
         }
         if self.cfg.test_pattern {
-            self.state.echo_pointer(x, y, mask);
+            self.state.echo_pointer(nx, ny, mask);
         } else if !self.cfg.view_only && self.cfg.input_enabled {
             self.ensure_input();
             if let Some(input) = self.input.as_mut() {
-                input.pointer(x, y, mask);
+                input.pointer(nx, ny, mask);
             }
         }
     }
@@ -2278,18 +2535,50 @@ mod apple_key_tests {
 
 #[cfg(test)]
 mod cursor_mode_tests {
-    use super::use_client_cursor;
+    use super::{expand_rect, hide_local_cursor, use_client_cursor};
+    use crate::diff::Rect;
     use crate::rfb::messages::pseudo;
 
     #[test]
-    fn encrypted_apple_sessions_get_the_composited_cursor() {
-        // Screen Sharing advertises -239 but does not draw it reliably.
+    fn cursor_erase_rect_has_margin_and_clamps() {
+        assert_eq!(
+            expand_rect(Rect::new(10, 10, 20, 20), 2, 100, 100),
+            Some(Rect::new(8, 8, 24, 24))
+        );
+        assert_eq!(
+            expand_rect(Rect::new(0, 0, 4, 4), 2, 100, 100),
+            Some(Rect::new(0, 0, 6, 6))
+        );
+        assert_eq!(
+            expand_rect(Rect::new(98, 98, 2, 2), 2, 100, 100),
+            Some(Rect::new(96, 96, 4, 4))
+        );
+        assert_eq!(expand_rect(Rect::new(10, 10, 1, 1), 2, 0, 0), None);
+    }
+
+    #[test]
+    fn cursor_mode_prefers_composited_for_apple() {
         let encodings = [16, 0, pseudo::RICH_CURSOR, pseudo::POINTER_POS];
+        // Screen Sharing gets the server-composited pointer.
         assert!(!use_client_cursor(true, false, &encodings));
-        // Even an explicit opt-out request is irrelevant for Apple clients.
-        assert!(!use_client_cursor(true, true, &encodings));
-        // The NO_EXT diagnostic path keeps the client cursor.
+        // Other viewers use the Rich Cursor when advertised.
         assert!(use_client_cursor(false, false, &encodings));
+        // Escape hatch: force the server-composited overlay.
+        assert!(!use_client_cursor(false, true, &encodings));
+        // No Rich Cursor: composite server-side.
+        assert!(!use_client_cursor(false, false, &[16, 0]));
+    }
+
+    #[test]
+    fn composited_cursor_hides_the_local_pointer() {
+        let encodings = [16, 0, pseudo::RICH_CURSOR];
+        // Server-composited mode: hide the viewer's local pointer.
+        assert!(hide_local_cursor(false, false, &encodings));
+        // Client-side cursor modes must keep it visible.
+        assert!(!hide_local_cursor(true, false, &encodings));
+        assert!(!hide_local_cursor(false, true, &encodings));
+        // No cursor pseudo-encoding: nothing to hide.
+        assert!(!hide_local_cursor(false, false, &[16, 0]));
     }
 
     #[test]
@@ -2300,6 +2589,8 @@ mod cursor_mode_tests {
         assert!(!use_client_cursor(false, false, &[16, 0]));
         // Escape hatch for clients that advertise -239 but ignore it.
         assert!(!use_client_cursor(false, true, &encodings));
+        // Apple clients always composite.
+        assert!(!use_client_cursor(true, false, &encodings));
     }
 }
 
@@ -2339,5 +2630,85 @@ mod client_info_tests {
             describe_client(&result(AuthMethod::AppleDh, false)),
             "RFB3.08 APPLE-DH [PLAIN]"
         );
+    }
+}
+
+#[cfg(test)]
+mod ard_layout_tests {
+    use super::*;
+
+    #[test]
+    fn display_layout_carries_geometry_and_scale() {
+        let msg = apple_display_layout_message(1280, 720, 960, 540, 0.75);
+        assert_eq!(&msg[0..4], &[0, 0, 0, 1]);
+        assert_eq!(
+            i32::from_be_bytes(msg[12..16].try_into().unwrap()),
+            1105,
+            "AppleDisplayLayout encoding"
+        );
+        let body = &msg[18..];
+        assert_eq!(u16::from_be_bytes(body[0..2].try_into().unwrap()), 5);
+        assert_eq!(u16::from_be_bytes(body[2..4].try_into().unwrap()), 1280);
+        assert_eq!(u16::from_be_bytes(body[4..6].try_into().unwrap()), 720);
+        assert_eq!(u16::from_be_bytes(body[6..8].try_into().unwrap()), 960);
+        assert_eq!(u16::from_be_bytes(body[8..10].try_into().unwrap()), 540);
+        let scale = f64::from_be_bytes(body[28..36].try_into().unwrap());
+        assert!((scale - 0.75).abs() < 1e-9);
+        assert_eq!(u16::from_be_bytes(body[18..20].try_into().unwrap()), 1);
+    }
+
+    #[test]
+    fn capability_bits_follow_the_enabled_features() {
+        use crate::rfb::messages::apple;
+        let caps = apple_server_caps(true, true);
+        for command in [0x0b, 0x12, 0x15, 0x1f, 0x20, 0x21, 0x22] {
+            assert!(apple::has(&caps, command), "missing cap 0x{command:02x}");
+        }
+        let caps = apple_server_caps(false, false);
+        for command in [0x0b, 0x15, 0x1f, 0x20, 0x22] {
+            assert!(
+                !apple::has(&caps, command),
+                "unexpected cap 0x{command:02x}"
+            );
+        }
+        assert!(apple::has(&caps, 0x12));
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn apple_budget_fits_a_full_frame() {
+        // A 4K BGRA frame must not be split into progressive strips.
+        assert!(APPLE_UPDATE_BYTES >= 3840 * 2160 * 4);
+        assert!(APPLE_RECT_RAW >= 3840 * 2160 * 4);
+        let mut out = Vec::new();
+        split_rect(&mut out, Rect::new(0, 0, 3840, 2160), 4, APPLE_RECT_RAW);
+        assert_eq!(out.len(), 1, "4K frame was split");
+        assert_eq!(out[0], Rect::new(0, 0, 3840, 2160));
+    }
+
+    #[test]
+    fn apple_updates_get_a_whole_frame_budget() {
+        let interval = Duration::from_millis(16);
+        assert_eq!(
+            encode_budget(true, true, interval),
+            Duration::from_secs(2),
+            "apple incremental"
+        );
+        assert_eq!(
+            encode_budget(true, false, interval),
+            Duration::from_secs(2),
+            "apple full"
+        );
+        assert!(encode_budget(false, true, interval) <= MAX_UPDATE_BUDGET);
+    }
+
+    #[test]
+    fn pointer_maps_from_scaled_space() {
+        assert_eq!(native_pointer(50, 25, 0.5, (1280, 720)), (100, 50));
+        assert_eq!(
+            native_pointer(u16::MAX, u16::MAX, 0.5, (1280, 720)),
+            (1279, 719)
+        );
+        assert_eq!(native_pointer(10, 10, 1.0, (1280, 720)), (10, 10));
     }
 }

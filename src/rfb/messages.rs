@@ -111,10 +111,14 @@ pub enum ClientMessage {
     AppleSetEncryption {
         command: u16,
     },
+    /// Apple 3.889 viewer scale request (type 0x08): 0.0 or >1 means native.
+    AppleScaleFactor(f64),
     /// Apple 3.889 clipboard fetch (type 0x0b): `echo` is returned in the
-    /// 0x1f reply so the client can suppress its own echo.
+    /// 0x1f reply so the client can suppress its own echo. `promise` asks for
+    /// flavour metadata only; the viewer fetches the bytes when pasting.
     AppleClipboardFetch {
         echo: u32,
+        promise: bool,
     },
     /// Apple 3.889 rich pasteboard send (type 0x1f).
     AppleClipboardSend {
@@ -307,17 +311,19 @@ pub fn read_client_message(
             ClientMessage::AppleEncrypted { subtype, block }
         }
         8 if apple => {
-            // ScaleFactor: fixed 10 bytes.
+            // ScaleFactor: type + pad + f64 BE (10 bytes total).
             let mut payload = [0u8; 9];
             r.read_exact(&mut payload)?;
-            ClientMessage::AppleIgnored(8)
+            let scale = f64::from_be_bytes(payload[1..9].try_into().unwrap());
+            ClientMessage::AppleScaleFactor(scale)
         }
         11 if apple => {
             // ClipboardFetch: type + pad + pad2 + u32 echo = 8 bytes.
             let mut payload = [0u8; 7];
             r.read_exact(&mut payload)?;
+            let promise = payload[0] & 1 != 0;
             let echo = u32::from_be_bytes([payload[3], payload[4], payload[5], payload[6]]);
-            ClientMessage::AppleClipboardFetch { echo }
+            ClientMessage::AppleClipboardFetch { echo, promise }
         }
         12 if apple => {
             // SetCurtain: `[0x0c][pad][pad2][u16 size][body]`.
@@ -721,12 +727,39 @@ mod tests {
     fn parse_apple_clipboard_fetch() {
         let data = [0x0bu8, 0, 0, 0, 0, 0, 0, 7];
         let mut c = Cursor::new(data.to_vec());
-        let ClientMessage::AppleClipboardFetch { echo } =
+        let ClientMessage::AppleClipboardFetch { echo, promise } =
             read_client_message(&mut c, false, true).unwrap()
         else {
             panic!("wrong variant");
         };
         assert_eq!(echo, 7);
+        assert!(!promise);
+    }
+
+    #[test]
+    fn parse_apple_clipboard_fetch_promise() {
+        let data = [0x0bu8, 1, 0, 0, 0, 0, 0, 9];
+        let mut c = Cursor::new(data.to_vec());
+        let ClientMessage::AppleClipboardFetch { echo, promise } =
+            read_client_message(&mut c, false, true).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(echo, 9);
+        assert!(promise);
+    }
+
+    #[test]
+    fn parse_apple_scale_factor() {
+        let mut data = vec![0x08u8, 0];
+        data.extend_from_slice(&0.75f64.to_be_bytes());
+        let mut c = Cursor::new(data);
+        let ClientMessage::AppleScaleFactor(scale) =
+            read_client_message(&mut c, false, true).unwrap()
+        else {
+            panic!("wrong variant");
+        };
+        assert!((scale - 0.75).abs() < 1e-9);
     }
 
     #[test]

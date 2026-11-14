@@ -96,7 +96,9 @@ mod tests {
     fn injection_char_covers_punctuation() {
         // Characters reported as untypable over RFB: "/" needs no shift but
         // must not go through the host IME, the rest have no VK at all.
-        for ch in ['/', '"', '{', '*', '(', '!', '?', '<', '>', '|', ':', '~', '+', '_'] {
+        for ch in [
+            '/', '"', '{', '*', '(', '!', '?', '<', '>', '|', ':', '~', '+', '_',
+        ] {
             assert_eq!(injection_char(ch as u32), Some(ch), "failed for {ch:?}");
         }
     }
@@ -120,8 +122,8 @@ mod tests {
         assert_eq!(injection_char(0xFC), Some('ü'));
         assert_eq!(injection_char(0x0100_2026), Some('\u{2026}')); // direct Unicode keysym (…)
         assert_eq!(injection_char(0x0101_F600), Some('\u{1F600}')); // 😀
-        // Raw codepoints below the 0x01000000 Unicode base are not valid
-        // keysym encodings (0x2026 is not "…" on the wire).
+                                                                    // Raw codepoints below the 0x01000000 Unicode base are not valid
+                                                                    // keysym encodings (0x2026 is not "…" on the wire).
         assert_eq!(injection_char(0x2026), None);
         assert_eq!(injection_char(0x3000), None);
     }

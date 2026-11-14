@@ -507,6 +507,30 @@ mod tests {
     }
 
     #[test]
+    fn record_layer_reassembles_large_payloads() {
+        use std::io::Cursor;
+        let key = [0x33u8; 16];
+        let iv = [0x44u8; 16];
+        let payload: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        let mut enc = AppleStreamCipher::new(key, iv, 0);
+        let mut wire = Vec::new();
+        for chunk in payload.chunks(MAX_RECORD_BODY) {
+            wire.extend_from_slice(&enc.seal(chunk));
+        }
+
+        let mut dec = RecordDecoder::new(key, iv);
+        let mut reader = Cursor::new(wire);
+        let mut got = Vec::with_capacity(payload.len());
+        let mut buf = [0u8; 4096];
+        while got.len() < payload.len() {
+            let n = dec.read(&mut reader, &mut buf).unwrap();
+            assert!(n > 0, "decoder returned EOF early");
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, payload);
+    }
+
+    #[test]
     fn record_layer_rejects_tampering() {
         use std::io::Cursor;
         let key = [1u8; 16];

@@ -444,41 +444,74 @@ fn apple_session_starts_encrypted_record_layer() {
     let mut dec_seq = 0u32;
 
     // --- clipboard: server -> client ---
-    // Enable shared pasteboard (0x15 selector 1) and fetch with echo 42.
-    // No SetEncodings yet: the pusher waits for it, so no framebuffer records
-    // can interleave with the clipboard reply.
+    // Enable shared pasteboard (0x15 selector 1). The server should send an
+    // initial 0x14 status so the viewer fetches the current host pasteboard.
     s.write_all(&enc.seal(&[0x15, 0, 0, 1, 0, 0, 0, 0]))
         .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut saw_notice = false;
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.first() == Some(&0x14) {
+            assert_eq!(&body[6..8], &[0, 2], "pasteboard-changed status");
+            saw_notice = true;
+            break;
+        }
+    }
+    assert!(saw_notice, "no initial pasteboard notification");
+
+    // Promise-poll fetch: the reply echoes the promise flag.
+    let mut promise_fetch = vec![0x0bu8, 1, 0, 0];
+    promise_fetch.extend_from_slice(&41u32.to_be_bytes());
+    s.write_all(&enc.seal(&promise_fetch)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut fetched_promise = None;
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.first() != Some(&0x1f) {
+            continue;
+        }
+        assert!(body.len() >= 16);
+        assert_eq!(body[2], 1, "promise flag echoed");
+        assert_eq!(u32::from_be_bytes(body[4..8].try_into().unwrap()), 41);
+        let uncompressed = u32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
+        let compressed = u32::from_be_bytes(body[12..16].try_into().unwrap()) as usize;
+        assert_eq!(body.len(), 16 + compressed);
+        let archive = inflate(&body[16..], uncompressed);
+        fetched_promise = parse_text_archive(&archive);
+        break;
+    }
+    assert_eq!(
+        fetched_promise.as_deref(),
+        Some("from the windows host"),
+        "promise pasteboard reply"
+    );
+
+    // Full fetch.
     let mut fetch = vec![0x0bu8, 0, 0, 0];
     fetch.extend_from_slice(&42u32.to_be_bytes());
     s.write_all(&enc.seal(&fetch)).unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(4);
     let mut fetched = None;
     while Instant::now() < deadline {
         let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
-        if body.is_empty() {
+        if body.first() != Some(&0x1f) {
             continue;
         }
-        match body[0] {
-            0x1f => {
-                assert!(body.len() >= 16);
-                assert_eq!(u32::from_be_bytes(body[4..8].try_into().unwrap()), 42);
-                let uncompressed = u32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
-                let compressed = u32::from_be_bytes(body[12..16].try_into().unwrap()) as usize;
-                assert_eq!(body.len(), 16 + compressed);
-                let archive = inflate(&body[16..], uncompressed);
-                fetched = parse_text_archive(&archive);
-                break;
-            }
-            0x00 | 0x03 | 0x14 => continue,
-            other => panic!("unexpected record body type {other:#04x}"),
-        }
+        assert!(body.len() >= 16);
+        assert_eq!(body[2], 0, "full-data reply");
+        assert_eq!(u32::from_be_bytes(body[4..8].try_into().unwrap()), 42);
+        let uncompressed = u32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
+        let compressed = u32::from_be_bytes(body[12..16].try_into().unwrap()) as usize;
+        assert_eq!(body.len(), 16 + compressed);
+        let archive = inflate(&body[16..], uncompressed);
+        fetched = parse_text_archive(&archive);
+        break;
     }
     assert_eq!(
         fetched.as_deref(),
         Some("from the windows host"),
-        "server clipboard reply"
+        "full pasteboard reply"
     );
 
     // --- clipboard: client -> server ---
@@ -588,9 +621,63 @@ fn apple_session_starts_encrypted_record_layer() {
     assert!(saw_end, "download did not end");
     assert_eq!(downloaded, b"hello downloaded file");
 
+    // A path outside the share root (and not advertised) must be denied.
+    let denied_session = 9u32;
+    s.write_all(&enc.seal(&file_frame(
+        1,
+        denied_session,
+        &start_body("/does-not-exist.txt"),
+    )))
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut denied_status = None;
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.first() != Some(&0x22) {
+            continue;
+        }
+        let (command, session, payload) = parse_file_frame(&body);
+        if session == denied_session && command == 104 {
+            denied_status = Some(i32::from_le_bytes(payload[0..4].try_into().unwrap()));
+            break;
+        }
+    }
+    assert_eq!(denied_status, Some(-43), "missing download status");
+
+    // --- drag: 0x20 followed by a pointer release asks for a 0x1e target ---
+    let drag_archive = text_archive("drag");
+    let drag_compressed = zlib(&drag_archive);
+    let mut drag = vec![0x20u8, 0, 0, 0];
+    drag.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+    drag.extend_from_slice(&(drag_archive.len() as u32).to_be_bytes());
+    drag.extend_from_slice(&(drag_compressed.len() as u32).to_be_bytes());
+    drag.extend_from_slice(&drag_compressed);
+    s.write_all(&enc.seal(&drag)).unwrap();
+    s.write_all(&enc.seal(&[5, 1, 0, 100, 0, 200])).unwrap();
+    s.write_all(&enc.seal(&[5, 0, 0, 100, 0, 200])).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut drop_id = None;
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.first() != Some(&0x1e) {
+            continue;
+        }
+        drop_id = Some(u32::from_be_bytes(body[4..8].try_into().unwrap()));
+        let len = u32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
+        assert_eq!(&body[12..12 + len], b"/");
+        break;
+    }
+    assert_eq!(drop_id, Some(0x1122_3344), "drop destination id");
+
+    // --- scale: the server acknowledges but renders native ---
+    let mut scale_msg = vec![0x08u8, 0];
+    scale_msg.extend_from_slice(&0.5f64.to_be_bytes());
+    s.write_all(&enc.seal(&scale_msg)).unwrap();
+
     // --- framebuffer: negotiate encodings and wait for a pushed update ---
     let mut set_encodings = vec![2u8, 0];
-    let encodings: [i32; 3] = [16, 0, -239];
+    let encodings: [i32; 4] = [16, 0, -223, -239];
     set_encodings.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
     for e in encodings {
         set_encodings.extend_from_slice(&e.to_be_bytes());
@@ -599,6 +686,8 @@ fn apple_session_starts_encrypted_record_layer() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut saw_update = false;
+    let mut saw_layout = false;
+    let mut saw_hidden_cursor = false;
     while Instant::now() < deadline {
         let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
         if body.is_empty() {
@@ -606,16 +695,51 @@ fn apple_session_starts_encrypted_record_layer() {
         }
         match body[0] {
             0 => {
-                assert!(body.len() >= 4);
+                assert!(body.len() >= 16);
                 let nrects = u16::from_be_bytes([body[2], body[3]]);
                 assert!(nrects > 0, "framebuffer update carried no rects");
-                saw_update = true;
-                break;
+                let width = u16::from_be_bytes([body[8], body[9]]);
+                let height = u16::from_be_bytes([body[10], body[11]]);
+                let encoding = i32::from_be_bytes(body[12..16].try_into().unwrap());
+                match encoding {
+                    -223 => {
+                        assert_eq!((width, height), (1280, 720), "NEW_FB_SIZE");
+                    }
+                    -239 => {
+                        // The composited pointer is authoritative; Screen
+                        // Sharing must hide its local pointer or both trail.
+                        assert_eq!((width, height), (0, 0), "hidden local cursor");
+                        saw_hidden_cursor = true;
+                    }
+                    1105 => {
+                        let payload_len = u16::from_be_bytes([body[16], body[17]]) as usize;
+                        assert!(body.len() >= 18 + payload_len);
+                        let layout = &body[18..18 + payload_len];
+                        assert_eq!(u16::from_be_bytes([layout[0], layout[1]]), 5);
+                        assert_eq!(u16::from_be_bytes([layout[2], layout[3]]), 1280);
+                        assert_eq!(u16::from_be_bytes([layout[4], layout[5]]), 720);
+                        assert_eq!(u16::from_be_bytes([layout[6], layout[7]]), 1280);
+                        assert_eq!(u16::from_be_bytes([layout[8], layout[9]]), 720);
+                        let scale = f64::from_be_bytes(layout[28..36].try_into().unwrap());
+                        assert!((scale - 1.0).abs() < 1e-9, "native render scale");
+                        saw_layout = true;
+                    }
+                    0 | 5 | 16 => {
+                        assert_eq!(width, 1280, "framebuffer width");
+                        saw_update = true;
+                    }
+                    other => panic!("unexpected rect encoding {other}"),
+                }
+                if saw_update && saw_layout && saw_hidden_cursor {
+                    break;
+                }
             }
             0x14 | 0x03 => continue,
             other => panic!("unexpected record body type {other:#04x}"),
         }
     }
+    assert!(saw_layout, "no display layout after the scale request");
+    assert!(saw_hidden_cursor, "server did not hide the local cursor");
     assert!(saw_update, "no encrypted framebuffer update within 10s");
 
     // Input after activation is a record body carrying an ECB block under the

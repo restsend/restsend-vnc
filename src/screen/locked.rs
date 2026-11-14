@@ -129,7 +129,11 @@ fn register_resume_notification() {
 
     let mut handle: *mut std::ffi::c_void = ptr::null_mut();
     let rc = unsafe {
-        PowerRegisterSuspendResumeNotification(DEVICE_NOTIFY_CALLBACK, HANDLE(&PARAMS.0 as *const _ as *mut _), &mut handle)
+        PowerRegisterSuspendResumeNotification(
+            DEVICE_NOTIFY_CALLBACK,
+            HANDLE(&PARAMS.0 as *const _ as *mut _),
+            &mut handle,
+        )
     };
     if rc.is_err() {
         tracing::warn!("cannot register suspend/resume notifications: {rc:?}");
@@ -143,6 +147,15 @@ fn register_resume_notification() {
 #[cfg(not(target_os = "windows"))]
 fn register_resume_notification() {}
 
+/// WTS_SESSIONSTATE_UNLOCK = 0, WTS_SESSIONSTATE_LOCK = 1. Getting this
+/// backwards shows the lock notice on an idle but unlocked desktop (the
+/// capture is legitimately stalled while nothing on screen changes).
+const WTS_SESSIONSTATE_LOCK: i32 = 1;
+
+fn flags_locked(flags: i32) -> bool {
+    flags == WTS_SESSIONSTATE_LOCK
+}
+
 /// True when the interactive session is locked / a secure desktop is up.
 #[cfg(target_os = "windows")]
 fn is_locked() -> bool {
@@ -153,7 +166,6 @@ fn is_locked() -> bool {
 
     // WTSSessionInfoEx == 25; Level1.SessionFlags sits at buffer offset 12.
     const WTS_SESSION_INFO_EX: i32 = 25;
-    const WTS_SESSIONSTATE_LOCK: i32 = 0;
 
     let mut buf = windows::core::PWSTR::null();
     let mut bytes = 0u32;
@@ -176,7 +188,7 @@ fn is_locked() -> bool {
         let level = std::ptr::read_unaligned(base as *const u32);
         if level == 1 {
             let flags = std::ptr::read_unaligned(base.add(12) as *const i32);
-            locked = flags == WTS_SESSIONSTATE_LOCK;
+            locked = flags_locked(flags);
         }
         WTSFreeMemory(buf.0 as _);
     }
@@ -259,4 +271,15 @@ fn draw_centered(
     let total = font::text_width(text, scale);
     let x = panel_x + panel_w.saturating_sub(total) / 2;
     font::draw_text(f, x, y, text, scale, color);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flags_locked;
+
+    #[test]
+    fn wts_lock_flag_is_one() {
+        assert!(!flags_locked(0), "WTS_SESSIONSTATE_UNLOCK");
+        assert!(flags_locked(1), "WTS_SESSIONSTATE_LOCK");
+    }
 }

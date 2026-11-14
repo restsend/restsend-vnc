@@ -130,11 +130,12 @@ about 3.8 MB (down from 4.9 MB with thin LTO).
 - Elevated windows (Task Manager, UAC) require running as administrator (Windows UIPI)
 - Punctuation and non-ASCII characters are injected as Unicode text (the exact character, regardless of host keyboard layout and without going through the host IME); letters, digits and space use virtual keys so shortcuts (Ctrl+C, Alt+Tab) keep working, and punctuation pressed together with Ctrl/Alt also keeps its virtual key so editor chords like Ctrl+/ still fire
 - The capture session is recreated after lock/unlock and after sleep/hibernate resume, because Windows.Graphics.Capture resumes without its yellow screen-sharing border
-- Apple/ARD clients (macOS Screen Sharing) always get a server-composited pointer: they advertise the Rich Cursor pseudo-encoding but do not reliably draw it, and macOS hides the local pointer while typing. Other viewers keep the zero-traffic client-side cursor
+- Apple/ARD clients (macOS Screen Sharing) use the server-composited pointer: the server hides the client's local pointer and draws/erases its own, because Screen Sharing's local cursor leaves old cursors behind during full-frame updates. Other viewers use the zero-traffic client-side Rich Cursor; `RESTSEND_VNC_CURSOR_SERVER=1` forces the composited overlay for them, and `RESTSEND_VNC_CURSOR_ALPHA=1` opts Apple clients into CursorAlpha (1104) for protocol testing
 - Connection confirmation fails closed: a console build prompts on stdin, and rejects the connection when no terminal/UI is available
 - Internal test hooks: `RESTSEND_VNC_APPROVAL=accept|reject|timeout`, `RESTSEND_VNC_APPROVAL_TIMEOUT_MS`, and `RESTSEND_VNC_ALLOW_MULTIPLE=1` (bypass the single-instance mutex) are used by the integration tests. `RESTSEND_VNC_CLIPBOARD_FILE=<path>` substitutes a file for the host clipboard (headless tests), `RESTSEND_VNC_APPLE_NO_EXT=1` disables the extended ARD ServerInit and `RESTSEND_VNC_APPLE_NO_ENC=1` keeps Apple frames plaintext for protocol diagnosis
 - macOS Screen Sharing shares its pasteboard only over the encrypted ARD control channel: text works in both directions, and copied files are advertised as `public.file-url` items so the Mac can fetch them through the ARD file channel
 - The debug overlay's `CLI` line ends in `[TLS]` or `[PLAIN]` so the live link's encryption is visible
+- Windows pointer trails are disabled only while a capture session is active (and restored on stop), because some Windows builds composite the trail ghosts into the captured frame and they appear as dark dots behind fast pointer movement
 - The password is stored in plain text in `settings.ini`
 - Default log level is `warn` (`-v` or `RUST_LOG` for more)
 

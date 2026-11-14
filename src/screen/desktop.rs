@@ -11,12 +11,16 @@
 //! supports that setting. The OS capture border is kept as the visual
 //! "screen is being shared" reminder.
 
+use std::ffi::c_void;
 use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, HMONITOR, MONITORINFO};
+use windows::Win32::UI::WindowsAndMessaging::{
+    SystemParametersInfoW, SPI_GETMOUSETRAILS, SPI_SETMOUSETRAILS,
+};
 use windows_capture::capture::{Context, GraphicsCaptureApiHandler};
 use windows_capture::frame::Frame as CaptureFrame;
 use windows_capture::graphics_capture_api::{GraphicsCaptureApi, InternalCaptureControl};
@@ -213,6 +217,54 @@ fn run(display_index: usize, fps: u32, state: Arc<ScreenState>) {
     }
 }
 
+/// Temporarily disables Windows pointer trails while sharing. WGC is asked
+/// to exclude the cursor, but some builds still composite trail ghosts from
+/// the cursor layer; those show up as small dark dots behind fast movement.
+/// The original setting is restored when the capture session stops.
+struct PointerTrailsGuard {
+    previous: Option<u32>,
+}
+
+impl PointerTrailsGuard {
+    fn new() -> Self {
+        Self {
+            previous: disable_pointer_trails(),
+        }
+    }
+}
+
+impl Drop for PointerTrailsGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            unsafe {
+                let _ =
+                    SystemParametersInfoW(SPI_SETMOUSETRAILS, previous, None, Default::default());
+            }
+        }
+    }
+}
+
+fn disable_pointer_trails() -> Option<u32> {
+    let mut trails = 0u32;
+    let got = unsafe {
+        SystemParametersInfoW(
+            SPI_GETMOUSETRAILS,
+            0,
+            Some(&mut trails as *mut u32 as *mut c_void),
+            Default::default(),
+        )
+    };
+    if got.is_err() || trails == 0 {
+        return None;
+    }
+    let set = unsafe { SystemParametersInfoW(SPI_SETMOUSETRAILS, 0, None, Default::default()) };
+    if set.is_err() {
+        return None;
+    }
+    tracing::info!("pointer trails were enabled ({trails}); disabled them while sharing");
+    Some(trails)
+}
+
 fn capture_session(
     display_index: usize,
     fps: u32,
@@ -224,15 +276,20 @@ fn capture_session(
         tracing::info!("capturing display {display_index} ({w}x{h})");
     }
 
-    // Be conservative on older Windows builds: only request optional WGC
-    // features that this OS advertises. Requesting an unsupported feature
-    // makes windows-capture reject the whole session.
-    let cursor = if GraphicsCaptureApi::is_cursor_settings_supported().unwrap_or(false) {
-        CursorCaptureSettings::WithoutCursor
-    } else {
-        tracing::warn!("this Windows build cannot disable cursor capture");
-        CursorCaptureSettings::Default
+    // Always try to exclude the OS cursor from the captured frame. The server
+    // composites the pointer itself; a captured cursor would leave a second
+    // pointer and visible trails behind fast mouse movement.
+    // `is_cursor_settings_supported` is only a hint: some builds report false
+    // but accept the setting, so try it and fall back on the explicit error.
+    let cursor_supported = GraphicsCaptureApi::is_cursor_settings_supported().unwrap_or(false);
+    let preferred = match std::env::var("RESTSEND_VNC_CAPTURE_CURSOR").as_deref() {
+        Ok("on") | Ok("1") => CursorCaptureSettings::WithCursor,
+        _ => CursorCaptureSettings::WithoutCursor,
     };
+    tracing::info!(
+        "capture cursor: {:?} (settings supported: {cursor_supported})",
+        preferred
+    );
     // Keep the OS capture border: it is the visible reminder that the screen
     // is being shared, and it matches the previous scap behaviour. On old
     // Windows builds, requesting "no border" would fail the whole session.
@@ -245,20 +302,36 @@ fn capture_session(
         MinimumUpdateIntervalSettings::Default
     };
 
-    let settings = Settings::new(
-        monitor,
-        cursor,
-        border,
-        SecondaryWindowSettings::Default,
-        interval,
-        DirtyRegionSettings::Default,
-        ColorFormat::Bgra8,
-        (Arc::clone(state), monitor),
-    );
+    let make_settings = |cursor_setting| {
+        Settings::new(
+            monitor,
+            cursor_setting,
+            border,
+            SecondaryWindowSettings::Default,
+            interval,
+            DirtyRegionSettings::Default,
+            ColorFormat::Bgra8,
+            (Arc::clone(state), monitor),
+        )
+    };
 
-    let control = CaptureHandler::start_free_threaded(settings)
-        .map_err(|e| io::Error::other(format!("capture start failed: {e}")))?;
+    let control = match CaptureHandler::start_free_threaded(make_settings(preferred)) {
+        Ok(control) => control,
+        Err(windows_capture::capture::GraphicsCaptureApiError::GraphicsCaptureApiError(
+            windows_capture::graphics_capture_api::Error::CursorConfigUnsupported,
+        )) => {
+            tracing::warn!(
+                "this Windows build cannot exclude the cursor from the capture; viewers may see a second pointer or trails"
+            );
+            CaptureHandler::start_free_threaded(make_settings(CursorCaptureSettings::Default))
+                .map_err(|e| io::Error::other(format!("capture start failed: {e}")))?
+        }
+        Err(e) => {
+            return Err(io::Error::other(format!("capture start failed: {e}")));
+        }
+    };
 
+    let _pointer_trails = PointerTrailsGuard::new();
     let started = Instant::now();
     let mut generation_before = state.generation();
     let mut stale_warned = false;

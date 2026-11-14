@@ -353,7 +353,9 @@ mod tests {
     fn shifted_punctuation_routes_to_unicode_injection() {
         // Shifted punctuation has no virtual key of its own; before the
         // Unicode route these keysyms were silently dropped.
-        for ch in ['*', '(', '{', '"', '!', '@', '#', '%', '&', '_', '+', '|', ':', '<', '>', '?'] {
+        for ch in [
+            '*', '(', '{', '"', '!', '@', '#', '%', '&', '_', '+', '|', ':', '<', '>', '?',
+        ] {
             assert_eq!(ks::injection_char(ch as u32), Some(ch), "failed for {ch:?}");
         }
         // "/" does map to an OEM VK, but is normally injected as Unicode so

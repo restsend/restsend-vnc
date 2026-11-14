@@ -920,6 +920,166 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    fn temp_root() -> (PathBuf, Arc<ShareRoot>) {
+        let dir = std::env::temp_dir().join(format!(
+            "restsend-ard-recv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let root = Arc::new(ShareRoot::new(&dir).unwrap());
+        (dir, root)
+    }
+
+    fn body(msg: &[u8]) -> &[u8] {
+        &msg[HEADER_SIZE..]
+    }
+
+    fn run_upload(
+        receiver: &mut UploadReceiver,
+        session: u32,
+        name: &str,
+        data: &[u8],
+        compressed: bool,
+    ) -> (i16, String) {
+        assert!(receiver
+            .handle(
+                CMD_START_RECEIVE,
+                body(&start_message(CMD_START_RECEIVE, session, 0, "/"))
+            )
+            .is_none());
+        assert!(receiver
+            .handle(
+                CMD_ITEM_INFO,
+                body(&item_info_message(
+                    session,
+                    true,
+                    data.len() as u64,
+                    (data.len() as u64).div_ceil(4096) * 4096,
+                    1,
+                    0
+                ))
+            )
+            .is_none());
+        assert!(receiver
+            .handle(
+                CMD_NEW_ITEM,
+                body(&new_item_message(
+                    session,
+                    &NewItem {
+                        name,
+                        size: data.len() as u64,
+                        mode: 0o100644,
+                        level: 0,
+                        item_type: ITEM_TYPE_FILE,
+                        link_target: "",
+                    }
+                ))
+            )
+            .is_none());
+        if compressed {
+            use flate2::write::ZlibEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+            encoder.write_all(data).unwrap();
+            let z = encoder.finish().unwrap();
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u16.to_be_bytes());
+            payload.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            payload.extend_from_slice(&(z.len() as u32).to_be_bytes());
+            payload.extend_from_slice(&z);
+            assert!(receiver.handle(CMD_COMPRESSED_DATA, &payload).is_none());
+        } else {
+            assert!(receiver
+                .handle(CMD_DATA, body(&data_message(session, data)))
+                .is_none());
+        }
+        let done = receiver
+            .handle(CMD_END, body(&end_message(session, 0)))
+            .expect("receiver done");
+        let (command, done_session, payload) = parse_frame(&done).unwrap();
+        assert_eq!((command, done_session), (CMD_RECEIVER_DONE, session));
+        let status = i16::from_be_bytes(payload[0..2].try_into().unwrap());
+        let name_len = u16::from_be_bytes(payload[2..4].try_into().unwrap()) as usize;
+        let name = String::from_utf8_lossy(&payload[4..4 + name_len]).into_owned();
+        (status, name)
+    }
+
+    #[test]
+    fn receiver_writes_a_file_and_reports_done() {
+        let (dir, root) = temp_root();
+        let mut receiver = UploadReceiver::new(7, root);
+        let (status, name) = run_upload(&mut receiver, 7, "a.txt", b"abc", false);
+        assert_eq!(status, 0);
+        assert_eq!(name, "a.txt");
+        assert_eq!(fs::read(dir.join(&name)).unwrap(), b"abc");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn receiver_uniquifies_duplicate_top_level_names() {
+        let (dir, root) = temp_root();
+        let mut first = UploadReceiver::new(1, Arc::clone(&root));
+        let (status, name) = run_upload(&mut first, 1, "a.txt", b"one", false);
+        assert_eq!((status, name.as_str()), (0, "a.txt"));
+        let mut second = UploadReceiver::new(2, root);
+        let (status, name2) = run_upload(&mut second, 2, "a.txt", b"two", false);
+        assert_eq!(status, 0);
+        assert_eq!(name2, "a 2.txt");
+        assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"one");
+        assert_eq!(fs::read(dir.join("a 2.txt")).unwrap(), b"two");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn receiver_rejects_path_traversal_names() {
+        let (dir, root) = temp_root();
+        let mut receiver = UploadReceiver::new(3, root);
+        assert!(receiver
+            .handle(
+                CMD_START_RECEIVE,
+                body(&start_message(CMD_START_RECEIVE, 3, 0, "/"))
+            )
+            .is_none());
+        let done = receiver
+            .handle(
+                CMD_NEW_ITEM,
+                body(&new_item_message(
+                    3,
+                    &NewItem {
+                        name: "../evil",
+                        size: 1,
+                        mode: 0o100644,
+                        level: 0,
+                        item_type: ITEM_TYPE_FILE,
+                        link_target: "",
+                    },
+                )),
+            )
+            .expect("rejected item");
+        let (command, _, payload) = parse_frame(&done).unwrap();
+        assert_eq!(command, CMD_RECEIVER_DONE);
+        let status = i16::from_be_bytes(payload[0..2].try_into().unwrap());
+        assert_ne!(status, 0);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert!(!dir.join("../evil").exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn receiver_accepts_compressed_data() {
+        let (dir, root) = temp_root();
+        let mut receiver = UploadReceiver::new(4, root);
+        let (status, name) = run_upload(&mut receiver, 4, "z.txt", b"compressed payload", true);
+        assert_eq!(status, 0);
+        assert_eq!(fs::read(dir.join(&name)).unwrap(), b"compressed payload");
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn local_path_from_url() {
         assert_eq!(

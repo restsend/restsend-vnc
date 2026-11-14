@@ -15,18 +15,19 @@ use std::time::Instant;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, RedrawWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW,
-    DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL, HBRUSH, HFONT, OUT_DEFAULT_PRECIS,
-    RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
+    CreateFontW, GetSysColorBrush, InvalidateRect, RedrawWindow, SetBkMode, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, COLOR_WINDOW, DEFAULT_CHARSET, DEFAULT_PITCH, FF_DONTCARE, FW_NORMAL,
+    HBRUSH, HDC, HFONT, OUT_DEFAULT_PRECIS, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
+    RDW_UPDATENOW, TRANSPARENT,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     CheckDlgButton, InitCommonControlsEx, IsDlgButtonChecked, DLG_BUTTON_CHECK_STATE,
-    ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR,
-    TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL, TCN_SELCHANGE,
-    WC_TABCONTROLW,
+    EM_SETPASSWORDCHAR, ICC_STANDARD_CLASSES, ICC_TAB_CLASSES, ICC_WIN95_CLASSES,
+    INITCOMMONCONTROLSEX, NMHDR, TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL,
+    TCN_SELCHANGE, WC_TABCONTROLW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
@@ -62,6 +63,7 @@ const C_TLS: i32 = 1014;
 const C_CONFIRM: i32 = 1015;
 const C_ALLOW: i32 = 1016;
 const C_VIEWONLY: i32 = 1017;
+const C_PASS_SHOW: i32 = 1018;
 const C_TABS: i32 = 1020;
 
 const C_CC_COUNT: i32 = 1031;
@@ -507,6 +509,8 @@ unsafe extern "system" fn confirm_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // Keep label backgrounds equal to the window background.
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => return control_color(wparam),
         WM_COMMAND => {
             if clicked(wparam, C_CC_ACCEPT) {
                 finish_confirm(hwnd, true);
@@ -845,14 +849,33 @@ unsafe fn open_settings() {
         edit, // stored in plain text by design
         f(100),
         f(56),
-        f(320),
+        f(250),
         f(24),
         C_PASS,
         hi,
     );
     let ptxt = wide(s.password.as_deref().unwrap_or(""));
     let _ = SetWindowTextW(pass, PCWSTR(ptxt.as_ptr()));
+    // Mask by default; the Show checkbox clears the password character.
+    let _ = SendMessageW(
+        pass,
+        EM_SETPASSWORDCHAR,
+        Some(WPARAM('*' as usize)),
+        Some(LPARAM(0)),
+    );
     security.push(pass);
+    security.push(ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Show"),
+        check,
+        f(360),
+        f(56),
+        f(100),
+        f(24),
+        C_PASS_SHOW,
+        hi,
+    ));
 
     security.push(ctrl(
         hwnd,
@@ -1151,6 +1174,19 @@ fn clicked(wparam: WPARAM, id: i32) -> bool {
     (wparam.0 & 0xffff) as i32 == id && ((wparam.0 >> 16) & 0xffff) == 0
 }
 
+/// Background brush for STATIC labels and check boxes.
+///
+/// `DefWindowProcW` answers `WM_CTLCOLORSTATIC`/`WM_CTLCOLORBTN` with the
+/// system button face because the STATIC/BUTTON classes have no background
+/// brush of their own. That gray does not match this window's white client
+/// area (`COLOR_WINDOW`), so labels would appear as gray boxes. Return the
+/// window brush and draw text transparently so both stay the same colour.
+unsafe fn control_color(wparam: WPARAM) -> LRESULT {
+    let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    LRESULT(GetSysColorBrush(COLOR_WINDOW).0 as isize)
+}
+
 /// Native "select folder" dialog for the shared-directory field.
 unsafe fn pick_folder(owner: HWND) -> Option<PathBuf> {
     let mut display = [0u16; 260];
@@ -1183,7 +1219,21 @@ unsafe extern "system" fn settings_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // Labels and check boxes must share the window's white background.
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => return control_color(wparam),
         WM_COMMAND => {
+            if clicked(wparam, C_PASS_SHOW) {
+                let show = IsDlgButtonChecked(hwnd, C_PASS_SHOW) == 1;
+                let pass = GetDlgItem(Some(hwnd), C_PASS).unwrap_or_default();
+                let _ = SendMessageW(
+                    pass,
+                    EM_SETPASSWORDCHAR,
+                    Some(WPARAM(if show { 0 } else { '*' as usize })),
+                    Some(LPARAM(0)),
+                );
+                let _ = InvalidateRect(Some(pass), None, true);
+                return LRESULT(0);
+            }
             if clicked(wparam, 1) {
                 let port = read_text(hwnd, C_PORT).parse::<u16>().unwrap_or(5900);
                 let sel = SendMessageW(

@@ -6,12 +6,13 @@
 //! encode pass just to move a 32x32 sprite.
 //!
 //! The cursor is handled in one of two ways per session:
-//! - if the client advertises the Rich Cursor pseudo-encoding (-239) we send
-//!   the shape once and let the viewer draw it locally (best: zero traffic
-//!   while moving);
-//! - otherwise the server composites a software cursor into a tiny overlay
-//!   rectangle and pushes it at up to 60 Hz (works with every viewer, unlike
-//!   pseudo-encodings which some clients ignore).
+//! - the server composites a software cursor into a tiny overlay rectangle and
+//!   pushes it at up to 60 Hz. Screen Sharing always uses this path, because
+//!   its client leaves trails when it draws a local cursor under rapid full
+//!   frame updates;
+//! - other viewers can use the Rich Cursor pseudo-encoding (-239): the shape is
+//!   sent once and the viewer draws it locally (zero traffic while moving);
+//! - Apple's CursorAlpha (1104) is available behind an opt-in test flag.
 
 use std::sync::Arc;
 
@@ -251,6 +252,40 @@ pub fn rich_cursor_message(shape: &CursorShape, enc: &PixelEncoder) -> Vec<u8> {
     out
 }
 
+/// Apple CursorAlpha (encoding 1104): a cached BGRA image plus a separate
+/// alpha plane, zlib-compressed. Screen Sharing draws this at its local
+/// pointer, which avoids the Rich Cursor artifacts some macOS builds show.
+pub fn cursor_alpha_message(shape: &CursorShape, cache_id: u32) -> Vec<u8> {
+    let w = shape.width as usize;
+    let h = shape.height as usize;
+    let mut raw = Vec::with_capacity(w * h * 5);
+    raw.extend_from_slice(&shape.bgra);
+    for px in shape.bgra.as_chunks::<4>().0 {
+        raw.push(px[3]);
+    }
+    // Apple frames this stream with Z_SYNC_FLUSH (no final block), like the
+    // pasteboard codec. A complete zlib stream makes Screen Sharing close the
+    // session when it inflates the cursor.
+    let mut encoder = flate2::Compress::new(flate2::Compression::best(), true);
+    let mut compressed = Vec::with_capacity(raw.len() + 128);
+    encoder
+        .compress_vec(&raw, &mut compressed, flate2::FlushCompress::Sync)
+        .expect("in-memory cursor compression");
+
+    let mut out = crate::rfb::messages::framebuffer_update_header(1);
+    out.extend_from_slice(&crate::rfb::messages::rect_header(
+        shape.hot_x,
+        shape.hot_y,
+        shape.width,
+        shape.height,
+        1104,
+    ));
+    out.extend_from_slice(&cache_id.to_be_bytes());
+    out.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    out.extend_from_slice(&compressed);
+    out
+}
+
 /// A zero-sized Cursor pseudo-rectangle hides the locally drawn cursor.
 pub fn hidden_cursor_message() -> Vec<u8> {
     let mut out = framebuffer_update_header(1);
@@ -467,6 +502,25 @@ mod tests {
             255, 0, 0, 255,   0, 0, 0, 0,
         ];
         CursorShape::new(2, 2, 0, 0, bgra)
+    }
+
+    #[test]
+    fn alpha_cursor_payload_shape() {
+        let shape = shape_2x2();
+        let msg = cursor_alpha_message(&shape, 1234);
+        assert_eq!(&msg[0..4], &[0, 0, 0, 1]);
+        assert_eq!(i32::from_be_bytes(msg[12..16].try_into().unwrap()), 1104);
+        assert_eq!(u32::from_be_bytes(msg[16..20].try_into().unwrap()), 1234);
+        let compressed = u32::from_be_bytes(msg[20..24].try_into().unwrap()) as usize;
+        assert_eq!(msg.len(), 24 + compressed);
+        let mut decoder = flate2::Decompress::new(true);
+        let mut raw = Vec::with_capacity(2 * 2 * 5);
+        decoder
+            .decompress_vec(&msg[24..], &mut raw, flate2::FlushDecompress::None)
+            .unwrap();
+        assert_eq!(raw.len(), 2 * 2 * 5, "BGRA + alpha plane");
+        assert_eq!(&raw[..16], shape.bgra.as_slice());
+        assert_eq!(&raw[16..], &[255, 128, 255, 0]);
     }
 
     #[test]

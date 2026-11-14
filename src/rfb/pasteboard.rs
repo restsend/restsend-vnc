@@ -19,10 +19,9 @@
 //! accepts. Text is carried as `public.utf8-plain-text`, with UTF-16 and the
 //! legacy Mac text flavor as fallbacks.
 
-use std::io::{self, Write};
+use std::io;
 
-use flate2::write::ZlibEncoder;
-use flate2::{Compression, Decompress, FlushDecompress, Status};
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 
 /// Cap on one compressed pasteboard payload.
 pub const MAX_COMPRESSED: usize = 16 << 20;
@@ -63,12 +62,33 @@ fn push_flavor(out: &mut Vec<u8>, uti: &str, tags: &[(&str, &str)], data: &[u8])
     put_blob(out, data);
 }
 
-/// A one-flavor text archive, the shape produced by Screen Sharing itself.
+fn push_text_flavors(out: &mut Vec<u8>, text: &str) {
+    push_flavor(
+        out,
+        UTF8_TEXT,
+        &[
+            ("com.apple.ostype", "utf8"),
+            ("com.apple.nspboard-type", "NSStringPboardType"),
+            ("public.mime-type", "text/plain;charset=utf-8"),
+        ],
+        text.as_bytes(),
+    );
+    push_flavor(
+        out,
+        LEGACY_TEXT,
+        &[("com.apple.ostype", "TEXT")],
+        text.as_bytes(),
+    );
+    let utf16: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect();
+    push_flavor(out, UTF16_TEXT, &[("com.apple.ostype", "utxt")], &utf16);
+}
+
+/// A text archive with the three flavours Apple's own server sends.
 #[allow(dead_code)]
 pub fn text_archive(text: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + text.len());
-    put_u32(&mut out, 1); // one flavor in the first "item"
-    push_flavor(&mut out, UTF8_TEXT, &[], text.as_bytes());
+    let mut out = Vec::with_capacity(128 + text.len() * 3);
+    put_u32(&mut out, 3);
+    push_text_flavors(&mut out, text);
     out
 }
 
@@ -113,8 +133,8 @@ pub fn content_archive(text: Option<&str>, files: &[std::path::PathBuf]) -> Vec<
     }
     let mut out = Vec::new();
     if let Some(text) = text.filter(|t| !t.is_empty()) {
-        put_u32(&mut out, 1);
-        push_flavor(&mut out, UTF8_TEXT, &[], text.as_bytes());
+        put_u32(&mut out, 3);
+        push_text_flavors(&mut out, text);
     }
     for file in files {
         put_u32(&mut out, 1);
@@ -134,9 +154,34 @@ pub fn empty_archive() -> [u8; 4] {
 }
 
 fn compress(archive: &[u8]) -> io::Result<Vec<u8>> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
-    encoder.write_all(archive)?;
-    encoder.finish()
+    // Apple frames the pasteboard with Z_SYNC_FLUSH (no final stream block).
+    let mut out = Vec::with_capacity(archive.len() + 128);
+    let mut encoder = Compress::new(Compression::best(), true);
+    let mut offset = 0usize;
+    loop {
+        let before_in = encoder.total_in() as usize;
+        let before_out = encoder.total_out() as usize;
+        let status = encoder
+            .compress_vec(&archive[offset..], &mut out, FlushCompress::Sync)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        offset += encoder.total_in() as usize - before_in;
+        let produced = encoder.total_out() as usize - before_out;
+        match status {
+            Status::StreamEnd | Status::Ok if offset >= archive.len() => break,
+            Status::BufError => {
+                if produced == 0 && offset >= archive.len() {
+                    break;
+                }
+                out.reserve(64 << 10);
+            }
+            _ => {
+                if offset >= archive.len() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Builds one `0x1f` ClipboardSend message. `echo` is copied from the `0x0b`
@@ -147,11 +192,11 @@ pub fn message(text: Option<&str>, echo: u32) -> io::Result<Vec<u8>> {
         Some(t) if !t.is_empty() => text_archive(t),
         _ => empty_archive().to_vec(),
     };
-    message_for_archive(&archive, echo)
+    message_for_archive(&archive, echo, false)
 }
 
 /// Builds one `0x1f` ClipboardSend from a pre-built archive.
-pub fn message_for_archive(archive: &[u8], echo: u32) -> io::Result<Vec<u8>> {
+pub fn message_for_archive(archive: &[u8], echo: u32, promise: bool) -> io::Result<Vec<u8>> {
     if archive.len() > MAX_ARCHIVE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -162,7 +207,7 @@ pub fn message_for_archive(archive: &[u8], echo: u32) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(16 + compressed.len());
     out.push(0x1f);
     out.push(0);
-    out.push(0); // promise: full data
+    out.push(u8::from(promise));
     out.push(0);
     out.extend_from_slice(&echo.to_be_bytes());
     out.extend_from_slice(&(archive.len() as u32).to_be_bytes());
@@ -354,6 +399,41 @@ mod tests {
     fn text_archive_roundtrip() {
         let archive = text_archive("héllo ✓");
         assert_eq!(text_from_archive(&archive).as_deref(), Some("héllo ✓"));
+    }
+
+    #[test]
+    fn text_archive_has_apples_three_flavours() {
+        let archive = text_archive("hi");
+        let items = parse_archive(&archive).unwrap();
+        let utis: Vec<&str> = items.iter().map(|item| item.uti.as_str()).collect();
+        assert_eq!(utis, vec![UTF8_TEXT, LEGACY_TEXT, UTF16_TEXT]);
+        assert_eq!(items[0].data, b"hi");
+        assert!(items[0]
+            .tags
+            .iter()
+            .any(|(key, value)| key == "com.apple.ostype" && value == "utf8"));
+        assert!(items[0]
+            .tags
+            .iter()
+            .any(|(key, _)| key == "com.apple.nspboard-type"));
+        assert_eq!(items[1].data, b"hi");
+        assert_eq!(
+            items[2].data,
+            "hi".encode_utf16()
+                .flat_map(|u| u.to_be_bytes())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn promise_flag_is_carried_in_the_header() {
+        let archive = text_archive("x");
+        let msg = message_for_archive(&archive, 0x1234, true).unwrap();
+        assert_eq!(msg[0], 0x1f);
+        assert_eq!(msg[2], 1, "promise byte");
+        assert_eq!(u32::from_be_bytes(msg[4..8].try_into().unwrap()), 0x1234);
+        let msg = message_for_archive(&archive, 0, false).unwrap();
+        assert_eq!(msg[2], 0);
     }
 
     #[test]

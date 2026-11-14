@@ -215,6 +215,27 @@ fn main() {
     ));
     state.set_debug(cfg.debug);
     spawn_sys_sampler(Arc::clone(&state));
+    #[cfg(not(target_os = "windows"))]
+    if std::env::var_os("RESTSEND_VNC_TEST_CURSOR").is_some() {
+        // macOS has no OS cursor poller; publish a synthetic arrow so the
+        // cursor pseudo-encodings can be exercised with the real client.
+        let state = Arc::clone(&state);
+        std::thread::spawn(move || {
+            let mut bgra = vec![0u8; 16 * 16 * 4];
+            for y in 0..14usize {
+                let width = (y + 1).min(8);
+                for x in 0..width {
+                    let i = (y * 16 + x) * 4;
+                    bgra[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+            state.set_cursor_shape(Some(Arc::new(crate::cursor::CursorShape::new(
+                16, 16, 0, 0, bgra,
+            ))));
+            state.set_cursor_visible(true);
+            state.set_cursor_pos(100, 100);
+        });
+    }
     // Encoder reads this when it creates its per-session zlib stream.
     std::env::set_var("RESTSEND_VNC_ZRLE_LEVEL", cfg.zrle_level.to_string());
     let kind = if cfg.test_pattern {
