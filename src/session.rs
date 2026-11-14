@@ -479,8 +479,8 @@ fn apple_keysym_target(keysym: u32) -> u32 {
 /// sessions therefore always get the server-composited cursor, which is part
 /// of the framebuffer and cannot be hidden by the client. `force_server`
 /// (`RESTSEND_VNC_CURSOR_SERVER`) overrides the choice for other clients.
-fn use_client_cursor(apple: bool, force_server: bool, encodings: &[i32]) -> bool {
-    !apple && !force_server && encodings.contains(&pseudo::RICH_CURSOR)
+fn use_client_cursor(composited_apple: bool, force_server: bool, encodings: &[i32]) -> bool {
+    !composited_apple && !force_server && encodings.contains(&pseudo::RICH_CURSOR)
 }
 
 fn writer_loop(
@@ -1664,7 +1664,8 @@ impl Session {
                 {
                     let mut st = self.enc.lock().unwrap();
                     let force_server = std::env::var_os("RESTSEND_VNC_CURSOR_SERVER").is_some();
-                    st.cursor_rich = use_client_cursor(self.apple_client, force_server, &encodings);
+                    st.cursor_rich =
+                        use_client_cursor(self.apple_client && self.apple_started, force_server, &encodings);
                     // The viewer already knows where its own pointer is.
                     // Echoing PointerPos at 60 Hz is redundant and some
                     // clients repaint badly when it interleaves with frame

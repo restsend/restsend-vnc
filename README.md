@@ -12,7 +12,7 @@ Works with standard VNC viewers and with macOS built-in Screen Sharing.
 - Rich ARD clipboard for macOS Screen Sharing (text), carried over the encrypted ARD control channel
 - TLS via VeNCrypt (RFB security type 19, X509None/X509Vnc subtypes), self-signed certificate generated on first use; works with TigerVNC and other VeNCrypt viewers
 - File transfer via Tight extensions (upload/download/resume/mkdir), off by default and sandboxed to the configured shared folder (defaults to your user directory)
-- ARD file transfer for macOS Screen Sharing (`0x22`), off by default and sandboxed to the same folder: drag files into the session to upload them, and copy files on Windows to paste them on the Mac
+- ARD file transfer for macOS Screen Sharing (`0x22`), off by default and sandboxed to the same folder: drag files into the session to upload them. Windows→Mac file paste is experimental (Screen Sharing's file-promise handling varies by version)
 - Tray icon + native tabbed settings window (General / Security / Files): port, colour level, password, title, loopback-only, keep-awake, debug panel, shared folder, encryption
 - Optional manual connection approval: every authenticated connection can require a local Accept/Reject click; no screen data is sent before approval, and unanswered requests are rejected after 30 seconds
 - CIDR allow-list for incoming peers (Security tab or `--allow-cidrs`); empty means allow all, and a malformed list fails closed
@@ -56,7 +56,7 @@ Default listen address is `0.0.0.0`. Enable **Only accept loopback connections**
 | TigerVNC | ✅ | ✅ (standard text clipboard) | ❌ | ✅ VeNCrypt (accept the self-signed prompt) |
 | RealVNC Viewer | ✅ | ✅ (standard text clipboard) | ❌ | ⚠️ depends on version; use auto mode |
 | TightVNC / UltraVNC | ✅ | ✅ (standard text clipboard) | ✅ Tight extension | ❌ no VeNCrypt; use `--tls off` or auto mode |
-| macOS built-in Screen Sharing | ✅ | ✅ text over the ARD control channel | ✅ drag & drop upload / clipboard file download (ARD `0x22`) | ❌ not supported; use auto mode |
+| macOS built-in Screen Sharing | ✅ | ✅ text over the ARD control channel | ✅ drag & drop upload (ARD `0x22`); Windows→Mac paste experimental | ❌ not supported; use auto mode |
 
 File transfer requires **Share files** to be enabled; both the Tight and ARD
 paths are sandboxed to the same configured folder.
@@ -65,7 +65,7 @@ paths are sandboxed to the same configured folder.
 
 - Config file: `%APPDATA%\restsend-vnc\settings.ini` (written by the tray)
 - Command-line flags apply to the current run only, are never written to the config file, and override it
-- File transfer is **off by default**. Enable **Share files** in Settings and choose a shared folder (defaults to your user directory); new connections pick the change up immediately. `--share-dir <DIR>` enables it for the current run only. Tight-compatible viewers use the Tight extension; macOS Screen Sharing uses Apple's `0x22` file-copy channel (drag files into the session to upload, copy files on Windows to paste them on the Mac). Both paths resolve paths inside the same sandbox; ARD uploads ignore the viewer-proposed destination and land in the shared folder
+- File transfer is **off by default**. Enable **Share files** in Settings and choose a shared folder (defaults to your user directory); new connections pick the change up immediately. `--share-dir <DIR>` enables it for the current run only. Tight-compatible viewers use the Tight extension; macOS Screen Sharing uses Apple's `0x22` file-copy channel (drag files into the session to upload them). Windows→Mac file paste is experimental: the host advertises copied files as `public.file-url` pasteboard items and serves them on request, but whether Screen Sharing asks for the bytes depends on the macOS version. Both paths resolve paths inside the same sandbox; ARD uploads ignore the viewer-proposed destination and land in the shared folder
 - Connection confirmation is **off by default**. Enable **Ask before accepting incoming connections** on the Security tab (or pass `--confirm`) to require a local Accept click for each new connection. The prompt appears after authentication and before `ServerInit`; rejected, timed-out (30 s) or unattended requests are closed without sending any screen data. At most 4 requests are queued; further connections are refused. Use `--no-confirm` to override the persisted setting for one run
 - The **Allowed networks (CIDR)** field on the Security tab restricts incoming peers. Entries are comma or space separated (`192.168.1.0/24, 10.0.0.0/8`); a bare address means a single host. Leave it empty to allow all. Loopback is **not** implicit, so add `127.0.0.1/32` if local viewers must connect. Invalid entries are rejected when saving; a hand-edited invalid list fails closed. The rule applies to new connections immediately (`--allow-cidrs LIST` overrides it for one run)
 - **View only** on the General tab makes new sessions display-only: keyboard, mouse, clipboard and file uploads are disabled. `--view-only` forces it for one run and `--no-view-only` overrides a persisted `view_only=1`. Existing sessions keep the mode they were opened with
