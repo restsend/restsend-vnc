@@ -52,12 +52,7 @@ fn put_blob(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
-fn push_flavor(
-    out: &mut Vec<u8>,
-    uti: &str,
-    tags: &[(&str, &str)],
-    data: &[u8],
-) {
+fn push_flavor(out: &mut Vec<u8>, uti: &str, tags: &[(&str, &str)], data: &[u8]) {
     put_blob(out, uti.as_bytes());
     put_u32(out, 0); // reserved
     put_u32(out, tags.len() as u32);
@@ -69,6 +64,7 @@ fn push_flavor(
 }
 
 /// A one-flavor text archive, the shape produced by Screen Sharing itself.
+#[allow(dead_code)]
 pub fn text_archive(text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + text.len());
     put_u32(&mut out, 1); // one flavor in the first "item"
@@ -90,6 +86,48 @@ pub fn file_archive(url: &str) -> Vec<u8> {
     out
 }
 
+/// Percent-encodes a local path into the `file:///C:/...` form used in the
+/// pasteboard. The Mac client treats the URL opaquely and echoes it back in
+/// the `0x22` download request.
+pub fn file_url(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let mut url = String::from("file:///");
+    let text = text.strip_prefix('/').unwrap_or(&text);
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'-' | b'_' | b'.' | b'~' => {
+                url.push(byte as char)
+            }
+            _ => url.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    url
+}
+
+/// Builds an archive carrying text and/or file URLs. Each file is its own
+/// "item" (one flavor), matching what Screen Sharing expects from a file
+/// pasteboard.
+pub fn content_archive(text: Option<&str>, files: &[std::path::PathBuf]) -> Vec<u8> {
+    if files.is_empty() && text.map(str::is_empty).unwrap_or(true) {
+        return empty_archive().to_vec();
+    }
+    let mut out = Vec::new();
+    if let Some(text) = text.filter(|t| !t.is_empty()) {
+        put_u32(&mut out, 1);
+        push_flavor(&mut out, UTF8_TEXT, &[], text.as_bytes());
+    }
+    for file in files {
+        put_u32(&mut out, 1);
+        push_flavor(
+            &mut out,
+            FILE_URL,
+            &[("com.apple.ostype", "furl")],
+            file_url(file).as_bytes(),
+        );
+    }
+    out
+}
+
 /// The "no items" archive: a single zero flavor count.
 pub fn empty_archive() -> [u8; 4] {
     [0, 0, 0, 0]
@@ -103,6 +141,7 @@ fn compress(archive: &[u8]) -> io::Result<Vec<u8>> {
 
 /// Builds one `0x1f` ClipboardSend message. `echo` is copied from the `0x0b`
 /// fetch request; `None`/empty text sends an empty archive.
+#[allow(dead_code)]
 pub fn message(text: Option<&str>, echo: u32) -> io::Result<Vec<u8>> {
     let archive = match text {
         Some(t) if !t.is_empty() => text_archive(t),
@@ -379,6 +418,17 @@ mod tests {
         assert_eq!(
             files_from_archive(&archive),
             vec!["file:///C:/Users/pi/file.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn content_archive_carries_text_and_files() {
+        let files = vec![std::path::PathBuf::from(r"C:\Users\pi\a b.txt")];
+        let archive = content_archive(Some("clip text"), &files);
+        assert_eq!(text_from_archive(&archive).as_deref(), Some("clip text"));
+        assert_eq!(
+            files_from_archive(&archive),
+            vec!["file:///C:/Users/pi/a%20b.txt".to_string()]
         );
     }
 }

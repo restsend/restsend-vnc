@@ -5,9 +5,23 @@
 //!   broadcasts ServerCutText to every registered session.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Host clipboard snapshot: text and/or a file list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardContent {
+    pub text: Option<String>,
+    pub files: Vec<PathBuf>,
+}
+
+impl ClipboardContent {
+    pub fn is_empty(&self) -> bool {
+        self.text.is_none() && self.files.is_empty()
+    }
+}
 
 /// Registry of session writer channels + echo suppression state.
 pub struct ClipboardHub {
@@ -18,8 +32,8 @@ pub struct ClipboardHub {
     next_id: AtomicU64,
     /// Text most recently set locally from ClientCutText (suppresses echo).
     last_local: Mutex<Option<String>>,
-    /// Last text seen by the watcher (dedup).
-    last_seen: Mutex<Option<String>>,
+    /// Last content seen by the watcher (dedup).
+    last_seen: Mutex<Option<ClipboardContent>>,
 }
 
 impl ClipboardHub {
@@ -107,25 +121,31 @@ impl ClipboardHub {
 fn watcher(hub: Arc<ClipboardHub>) {
     loop {
         std::thread::sleep(Duration::from_millis(500));
-        let Some(text) = get_clipboard_text() else {
-            continue; // non-text content on clipboard
+        let Some(content) = get_clipboard_content() else {
+            continue; // non-text, non-file content on clipboard
         };
-        if text.is_empty() {
+        if content.is_empty() {
             continue;
         }
         {
             let last_seen = hub.last_seen.lock().unwrap();
-            if last_seen.as_deref() == Some(text.as_str()) {
+            if last_seen.as_ref() == Some(&content) {
                 continue;
             }
         }
-        if hub.take_local_if_matches(&text) {
-            *hub.last_seen.lock().unwrap() = Some(text);
-            continue;
+        if let Some(text) = content.text.as_deref() {
+            if hub.take_local_if_matches(text) {
+                *hub.last_seen.lock().unwrap() = Some(content);
+                continue;
+            }
         }
-        *hub.last_seen.lock().unwrap() = Some(text.clone());
-        tracing::debug!(len = text.len(), "host clipboard changed, broadcasting");
-        hub.broadcast(crate::rfb::messages::server_cut_text(&text));
+        *hub.last_seen.lock().unwrap() = Some(content.clone());
+        if let Some(text) = content.text.as_deref() {
+            tracing::debug!(len = text.len(), "host clipboard changed, broadcasting");
+            hub.broadcast(crate::rfb::messages::server_cut_text(text));
+        } else {
+            tracing::debug!(files = content.files.len(), "host clipboard files changed");
+        }
         hub.broadcast_apple_pasteboard();
     }
 }
@@ -152,6 +172,25 @@ pub fn get_clipboard_text() -> Option<String> {
         return std::fs::read_to_string(path).ok();
     }
     arboard::Clipboard::new().ok()?.get_text().ok()
+}
+
+/// Reads text and/or file URLs from the host clipboard.
+pub fn get_clipboard_content() -> Option<ClipboardContent> {
+    if std::env::var_os("RESTSEND_VNC_CLIPBOARD_FILE").is_some() {
+        let text = get_clipboard_text().filter(|t| !t.is_empty());
+        return text.map(|text| ClipboardContent {
+            text: Some(text),
+            files: Vec::new(),
+        });
+    }
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let files = clipboard.get().file_list().unwrap_or_default();
+    let text = clipboard.get_text().ok().filter(|t| !t.is_empty());
+    if files.is_empty() && text.is_none() {
+        None
+    } else {
+        Some(ClipboardContent { text, files })
+    }
 }
 
 #[cfg(test)]

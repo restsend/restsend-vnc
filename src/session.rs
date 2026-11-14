@@ -207,9 +207,9 @@ pub fn handle_client(
         let extralen = 22 + cfg.name.len();
         init.extend_from_slice(&(extralen as u32).to_be_bytes());
         init.extend_from_slice(&[0u8, 0u8]); // u16 reserved
-        // bit 4 = extended info, bit 1 = control privilege, bits 5..7 = max
-        // virtual displays (1). View-only sessions advertise observe-only and
-        // drop the control privilege.
+                                             // bit 4 = extended info, bit 1 = control privilege, bits 5..7 = max
+                                             // virtual displays (1). View-only sessions advertise observe-only and
+                                             // drop the control privilege.
         let mut flags: u32 = 0x10 | 0x02 | (1 << 5);
         if cfg.view_only {
             flags = (flags & !0x02) | 0x01;
@@ -329,7 +329,8 @@ pub fn handle_client(
                     // ARD notifications are only meaningful once the client
                     // switched its stream to the record layer and enabled
                     // its shared pasteboard.
-                    if apple_client && !(ready.load(Ordering::Acquire) && enabled.load(Ordering::Acquire))
+                    if apple_client
+                        && !(ready.load(Ordering::Acquire) && enabled.load(Ordering::Acquire))
                     {
                         continue;
                     }
@@ -363,6 +364,9 @@ pub fn handle_client(
         apple_ready: Arc::clone(&apple_ready),
         apple_pasteboard,
         apple_auto_cmd: None,
+        ard_upload: None,
+        pending_drag: None,
+        ard_offered_files: Vec::new(),
         enc: Arc::clone(&enc),
         client_ready: Arc::clone(&client_ready),
         screen_dims: (w as u32, h as u32),
@@ -448,6 +452,19 @@ fn apple_keysym_target(keysym: u32) -> u32 {
         ks::META_R => ks::ALT_R,
         k => k,
     }
+}
+
+/// Chooses between the client-side (Rich Cursor) and server-composited
+/// cursor.
+///
+/// Apple's Screen Sharing advertises the Rich Cursor pseudo-encoding but does
+/// not reliably draw the shape it receives, and macOS hides the local pointer
+/// while typing — both leave the viewer with no visible pointer. Apple/ARD
+/// sessions therefore always get the server-composited cursor, which is part
+/// of the framebuffer and cannot be hidden by the client. `force_server`
+/// (`RESTSEND_VNC_CURSOR_SERVER`) overrides the choice for other clients.
+fn use_client_cursor(apple: bool, force_server: bool, encodings: &[i32]) -> bool {
+    !apple && !force_server && encodings.contains(&pseudo::RICH_CURSOR)
 }
 
 fn writer_loop(
@@ -1305,6 +1322,13 @@ struct Session {
     apple_pasteboard: Arc<AtomicBool>,
     /// Last auto-pasteboard command from the viewer (1 = enabled).
     apple_auto_cmd: Option<u16>,
+    /// In-progress Apple 0x22 upload from the viewer.
+    ard_upload: Option<crate::rfb::ard_file::UploadReceiver>,
+    /// Drag id from `0x20`; answered with `0x1e` when the pointer is released.
+    pending_drag: Option<u32>,
+    /// Files advertised to the viewer via the pasteboard; the only absolute
+    /// paths outside the share root that a download may read.
+    ard_offered_files: Vec<std::path::PathBuf>,
     enc: Arc<Mutex<EncState>>,
     client_ready: Arc<std::sync::atomic::AtomicBool>,
     screen_dims: (u32, u32),
@@ -1324,25 +1348,22 @@ impl Session {
         let ft_enabled = self.cfg.share_root.is_some() && !self.cfg.view_only;
         let mut stream = ClientStream::new(reader);
         loop {
-            let msg = match messages::read_client_message(
-                &mut stream,
-                ft_enabled,
-                self.apple_client,
-            ) {
-                Ok(msg) => msg,
-                // Normal client disconnect (plain TCP reset or TLS EOF).
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::UnexpectedEof
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe
-                    ) =>
-                {
-                    return Ok(())
-                }
-                Err(e) => return Err(e),
-            };
+            let msg =
+                match messages::read_client_message(&mut stream, ft_enabled, self.apple_client) {
+                    Ok(msg) => msg,
+                    // Normal client disconnect (plain TCP reset or TLS EOF).
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        return Ok(())
+                    }
+                    Err(e) => return Err(e),
+                };
             if let ClientMessage::AppleSetEncryption { command, .. } = msg {
                 self.handle_set_encryption(command, &mut stream, peer)?;
                 continue;
@@ -1357,6 +1378,137 @@ impl Session {
         if let Err(e) = self.send(crate::rfb::apple_auth::auto_pasteboard_info(cmd).to_vec()) {
             tracing::warn!("ARD status {cmd} send failed: {e}");
         }
+    }
+
+    /// True when the session may exchange files with the viewer.
+    fn files_enabled(&self) -> bool {
+        self.cfg.share_root.is_some() && !self.cfg.view_only
+    }
+
+    fn handle_apple_file(
+        &mut self,
+        peer: SocketAddr,
+        command: u16,
+        session: u32,
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        use crate::rfb::ard_file as af;
+        if command == af::CMD_START_RECEIVE {
+            let Some(root) = self.cfg.share_root.clone() else {
+                return Ok(());
+            };
+            let mut upload = af::UploadReceiver::new(session, root);
+            if let Some(reply) = upload.handle(command, body) {
+                self.send(reply)?;
+            }
+            tracing::info!("{peer}: ARD file upload started (session {session})");
+            self.ard_upload = Some(upload);
+            return Ok(());
+        }
+        if command == af::CMD_START_SEND {
+            return self.apple_download(peer, session, body);
+        }
+        let Some(upload) = self.ard_upload.as_mut() else {
+            tracing::debug!("{peer}: ARD file-copy command {command} without a transfer");
+            return Ok(());
+        };
+        if upload.session() != session {
+            tracing::debug!(
+                "{peer}: ARD file-copy session {session} does not match {}",
+                upload.session()
+            );
+            return Ok(());
+        }
+        if let Some(reply) = upload.handle(command, body) {
+            self.send(reply)?;
+        }
+        if matches!(command, af::CMD_END | af::CMD_STOP) {
+            self.ard_upload = None;
+        }
+        Ok(())
+    }
+
+    fn apple_download(
+        &mut self,
+        peer: SocketAddr,
+        session: u32,
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        use crate::rfb::ard_file as af;
+        let Some(start) = af::parse_start(body) else {
+            return Ok(());
+        };
+        let Some(root) = self.cfg.share_root.clone() else {
+            return Ok(());
+        };
+        let Some(path) = self.resolve_download(&root, &start.path) else {
+            tracing::info!("{peer}: ARD download {:?} denied", start.path);
+            self.send(af::end_message(session, af::STATUS_NOT_FOUND))?;
+            return Ok(());
+        };
+        let (info, item, size) = match af::download_meta(session, &path) {
+            Ok(meta) => meta,
+            Err(status) => {
+                self.send(af::end_message(session, status))?;
+                return Ok(());
+            }
+        };
+        let mut file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) => {
+                tracing::warn!("{peer}: cannot open {}: {e}", path.display());
+                self.send(af::end_message(session, af::STATUS_PERMISSION))?;
+                return Ok(());
+            }
+        };
+        tracing::info!("{peer}: ARD download {} ({size} bytes)", path.display());
+        self.send(info)?;
+        self.send(item)?;
+        let mut buffer = vec![0u8; af::CHUNK_SIZE];
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            self.send(af::data_message(session, &buffer[..n]))?;
+        }
+        self.send(af::end_message(session, 0))?;
+        Ok(())
+    }
+
+    fn resolve_download(&self, root: &ShareRoot, request: &str) -> Option<std::path::PathBuf> {
+        // Share-relative request (the destination path we returned via 0x1e).
+        if request.starts_with('/') {
+            if let Ok(path) = root.resolve(request) {
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+        // Absolute path echoed from a file URL: only under the share root or
+        // explicitly present in the current host clipboard file list.
+        let requested = crate::rfb::ard_file::local_path_from_request(request)?;
+        let canonical = requested.canonicalize().ok()?;
+        if canonical.starts_with(&root.canonical) && canonical.is_file() {
+            return Some(canonical);
+        }
+        if let Some(content) = crate::clipboard::get_clipboard_content() {
+            for file in content.files {
+                if let Ok(file) = file.canonicalize() {
+                    if file == canonical {
+                        return Some(canonical);
+                    }
+                }
+            }
+        }
+        for file in &self.ard_offered_files {
+            if let Ok(file) = file.canonicalize() {
+                if file == canonical {
+                    return Some(canonical);
+                }
+            }
+        }
+        None
     }
 
     /// Handles Apple's `0x12 SetEncryption`: command 1 requests the record
@@ -1429,8 +1581,7 @@ impl Session {
                 {
                     let mut st = self.enc.lock().unwrap();
                     let force_server = std::env::var_os("RESTSEND_VNC_CURSOR_SERVER").is_some();
-                    st.cursor_rich =
-                        use_client_cursor(self.apple_client, force_server, &encodings);
+                    st.cursor_rich = use_client_cursor(self.apple_client, force_server, &encodings);
                     // The viewer already knows where its own pointer is.
                     // Echoing PointerPos at 60 Hz is redundant and some
                     // clients repaint badly when it interleaves with frame
@@ -1489,19 +1640,26 @@ impl Session {
             ClientMessage::AppleAutoPasteboard(cmd) => {
                 tracing::info!("{peer}: Apple auto-pasteboard cmd={cmd} (1=enable 2=disable)");
                 self.apple_auto_cmd = Some(cmd);
-                self.apple_pasteboard
-                    .store(cmd == 1, Ordering::Release);
+                self.apple_pasteboard.store(cmd == 1, Ordering::Release);
             }
             ClientMessage::AppleClipboardFetch { echo } => {
                 if !self.cfg.clipboard_enabled || self.cfg.view_only {
                     return Ok(());
                 }
-                let text = crate::clipboard::get_clipboard_text();
+                let content = crate::clipboard::get_clipboard_content().unwrap_or_default();
                 tracing::debug!(
-                    "{peer}: Apple pasteboard fetch echo={echo} ({} bytes)",
-                    text.as_deref().map(str::len).unwrap_or(0)
+                    "{peer}: Apple pasteboard fetch echo={echo} ({} text bytes, {} files)",
+                    content.text.as_deref().map(str::len).unwrap_or(0),
+                    content.files.len()
                 );
-                match crate::rfb::pasteboard::message(text.as_deref(), echo) {
+                let archive = crate::rfb::pasteboard::content_archive(
+                    content.text.as_deref(),
+                    &content.files,
+                );
+                if !content.files.is_empty() {
+                    self.ard_offered_files = content.files.clone();
+                }
+                match crate::rfb::pasteboard::message_for_archive(&archive, echo) {
                     Ok(msg) => {
                         self.send(msg)?;
                     }
@@ -1551,10 +1709,28 @@ impl Session {
                 compressed,
                 data,
             } => {
+                if !self.files_enabled() {
+                    return Ok(());
+                }
+                if data.len() != compressed as usize {
+                    tracing::warn!(
+                        "{peer}: Apple drag truncated ({} of {compressed} bytes); ignored",
+                        data.len()
+                    );
+                    return Ok(());
+                }
+                if data.is_empty() || id == 0 {
+                    self.pending_drag = None;
+                    return Ok(());
+                }
+                let archive = crate::rfb::pasteboard::inflate(&data, uncompressed as usize)
+                    .unwrap_or_default();
+                let files = crate::rfb::pasteboard::files_from_archive(&archive);
                 tracing::info!(
-                    "{peer}: Apple drag id={id} ({} of {compressed} compressed / {uncompressed} raw bytes)",
-                    data.len()
+                    "{peer}: Apple drag id={id} with {} file URL(s)",
+                    files.len()
                 );
+                self.pending_drag = Some(id);
             }
             ClientMessage::AppleFileCopy {
                 version,
@@ -1562,11 +1738,15 @@ impl Session {
                 session,
                 body,
             } => {
-                tracing::debug!(
-                    "{peer}: Apple file-copy v{version} cmd={command} session={session} \
-                     body={} bytes",
-                    body.len()
-                );
+                if !self.files_enabled() {
+                    tracing::debug!("{peer}: Apple file copy refused (file sharing off)");
+                    return Ok(());
+                }
+                if version != 1 {
+                    tracing::debug!("{peer}: Apple file copy version {version} ignored");
+                    return Ok(());
+                }
+                self.handle_apple_file(peer, command, session, &body)?;
             }
             ClientMessage::AppleIgnored(kind) => {
                 tracing::trace!("{peer}: Apple message 0x{kind:02x} ignored");
@@ -1661,7 +1841,20 @@ impl Session {
         // Hidden shortcut: hold Ctrl and left-click 3 times (within 2s) to
         // toggle the debug overlay.
         let left_pressed = mask & 1 != 0 && self.last_mask & 1 == 0;
+        let left_released = mask & 1 == 0 && self.last_mask & 1 != 0;
         self.last_mask = mask;
+        if left_released {
+            if let Some(id) = self.pending_drag.take() {
+                if self.files_enabled() {
+                    // Tell the viewer where the drop landed; it then uploads
+                    // through 0x22. `/` maps to the configured share root.
+                    let reply = crate::rfb::ard_file::drop_destination_message(id, "/");
+                    if let Err(e) = self.send(reply) {
+                        tracing::debug!("ARD drop destination send failed: {e}");
+                    }
+                }
+            }
+        }
         if left_pressed && self.ctrl_held && crate::settings::ALLOW_DEBUG.load(Ordering::Relaxed) {
             let fresh = self
                 .cheat_at
@@ -1992,6 +2185,31 @@ mod apple_key_tests {
         assert_eq!(apple_keysym_target(ks::META_L), ks::ALT_L); // Option
         assert_eq!(apple_keysym_target(ks::CONTROL_L), ks::CONTROL_L);
         assert_eq!(apple_keysym_target(0x63), 0x63);
+    }
+}
+
+#[cfg(test)]
+mod cursor_mode_tests {
+    use super::use_client_cursor;
+    use crate::rfb::messages::pseudo;
+
+    #[test]
+    fn apple_clients_always_get_the_composited_cursor() {
+        // Screen Sharing advertises -239 but does not draw it reliably.
+        let encodings = [16, 0, pseudo::RICH_CURSOR, pseudo::POINTER_POS];
+        assert!(!use_client_cursor(true, false, &encodings));
+        // Even an explicit opt-out request is irrelevant for Apple clients.
+        assert!(!use_client_cursor(true, true, &encodings));
+    }
+
+    #[test]
+    fn other_clients_use_the_rich_cursor_when_negotiated() {
+        let encodings = [16, 0, pseudo::RICH_CURSOR];
+        assert!(use_client_cursor(false, false, &encodings));
+        // No Rich Cursor: composite server-side.
+        assert!(!use_client_cursor(false, false, &[16, 0]));
+        // Escape hatch for clients that advertise -239 but ignore it.
+        assert!(!use_client_cursor(false, true, &encodings));
     }
 }
 

@@ -108,10 +108,14 @@ pub enum ClientMessage {
     AppleViewerInfo(Vec<u8>),
     /// Apple 3.889 SetEncryption (type 0x12): command 1 starts the record
     /// layer, command 2 switches the client->server stream to records.
-    AppleSetEncryption { command: u16 },
+    AppleSetEncryption {
+        command: u16,
+    },
     /// Apple 3.889 clipboard fetch (type 0x0b): `echo` is returned in the
     /// 0x1f reply so the client can suppress its own echo.
-    AppleClipboardFetch { echo: u32 },
+    AppleClipboardFetch {
+        echo: u32,
+    },
     /// Apple 3.889 rich pasteboard send (type 0x1f).
     AppleClipboardSend {
         promise: bool,
@@ -604,7 +608,8 @@ mod tests {
         data.extend_from_slice(&(-223i32).to_be_bytes());
         data.extend_from_slice(&7i32.to_be_bytes());
         let mut c = Cursor::new(data);
-        let ClientMessage::SetEncodings(enc) = read_client_message(&mut c, false, false).unwrap() else {
+        let ClientMessage::SetEncodings(enc) = read_client_message(&mut c, false, false).unwrap()
+        else {
             panic!("wrong variant");
         };
         assert_eq!(enc, vec![0, -223, 7]);

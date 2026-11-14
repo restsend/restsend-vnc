@@ -156,6 +156,62 @@ fn inflate(data: &[u8], expected: usize) -> Vec<u8> {
     out
 }
 
+fn file_frame(command: u16, session: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0x22);
+    out.push(0);
+    out.extend_from_slice(&((8 + body.len()) as u32).to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&command.to_be_bytes());
+    out.extend_from_slice(&session.to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+fn start_body(path: &str) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&0u32.to_be_bytes()); // flags
+    body.extend_from_slice(&0u32.to_be_bytes());
+    body.extend_from_slice(&(path.len() as u16).to_be_bytes());
+    body.extend_from_slice(path.as_bytes());
+    body.push(0);
+    body
+}
+
+fn item_info_body(size: u64) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&1u32.to_be_bytes()); // single file
+    body.extend_from_slice(&0u32.to_be_bytes());
+    body.extend_from_slice(&size.to_be_bytes());
+    body.extend_from_slice(&size.div_ceil(4096).saturating_mul(4096).to_be_bytes());
+    body.extend_from_slice(&1u64.to_be_bytes());
+    body.extend_from_slice(&0u64.to_be_bytes());
+    body.extend_from_slice(&0u64.to_be_bytes());
+    body.extend_from_slice(&0u32.to_be_bytes());
+    assert_eq!(body.len(), 52);
+    body
+}
+
+fn new_item_body(name: &str, size: u64) -> Vec<u8> {
+    let mut body = vec![0u8; 104];
+    body[0] = 1; // file
+    body[42..50].copy_from_slice(&size.to_be_bytes());
+    body[94..96].copy_from_slice(&0o100644u16.to_be_bytes());
+    body[100..102].copy_from_slice(&(name.len() as u16).to_be_bytes());
+    body.extend_from_slice(name.as_bytes());
+    body.push(0);
+    body
+}
+
+/// Splits a 0x22 frame into `(command, session, body)`.
+fn parse_file_frame(frame: &[u8]) -> (u16, u32, &[u8]) {
+    assert_eq!(frame[0], 0x22);
+    assert_eq!(&frame[6..8], &1u16.to_be_bytes());
+    let command = u16::from_be_bytes(frame[8..10].try_into().unwrap());
+    let session = u32::from_be_bytes(frame[10..14].try_into().unwrap());
+    (command, session, &frame[14..])
+}
+
 fn cbc_encrypt(key: &[u8; 16], iv: &mut [u8; 16], data: &mut [u8]) {
     for block in data.as_chunks_mut::<16>().0 {
         for (b, v) in block.iter_mut().zip(iv.iter()) {
@@ -211,7 +267,10 @@ impl RecordCipher {
 
     fn open(s: &mut TcpStream, key: &[u8; 16], iv: &mut [u8; 16], seq: &mut u32) -> Vec<u8> {
         let size = read_u16(s) as usize;
-        assert!(size >= 32 && size.is_multiple_of(16), "bad record size {size}");
+        assert!(
+            size >= 32 && size.is_multiple_of(16),
+            "bad record size {size}"
+        );
         let mut ct = vec![0u8; size];
         s.read_exact(&mut ct).unwrap();
         cbc_decrypt(key, iv, &mut ct);
@@ -232,7 +291,10 @@ fn apple_dh(s: &mut TcpStream) -> [u8; 16] {
     let count = read_u8(s) as usize;
     let mut types = vec![0u8; count];
     s.read_exact(&mut types).unwrap();
-    assert!(types.contains(&30), "server did not offer Apple DH: {types:?}");
+    assert!(
+        types.contains(&30),
+        "server did not offer Apple DH: {types:?}"
+    );
     s.write_all(&[30]).unwrap();
 
     let generator = read_u16(s) as u32;
@@ -273,6 +335,12 @@ fn apple_session_starts_encrypted_record_layer() {
         port
     ));
     std::fs::write(&clip_file, "from the windows host").unwrap();
+    let share_dir = std::env::temp_dir().join(format!(
+        "restsend-vnc-apple-share-{}-{}",
+        std::process::id(),
+        port
+    ));
+    std::fs::create_dir_all(&share_dir).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_restsend-vnc"))
         .args([
             "--test-pattern",
@@ -284,6 +352,8 @@ fn apple_session_starts_encrypted_record_layer() {
             "127.0.0.1",
             "--port",
             &port.to_string(),
+            "--share-dir",
+            &share_dir.to_string_lossy(),
         ])
         .env("RESTSEND_VNC_ALLOW_MULTIPLE", "1")
         .env("RESTSEND_VNC_CLIPBOARD_FILE", &clip_file)
@@ -316,7 +386,10 @@ fn apple_session_starts_encrypted_record_layer() {
     let name_len = read_u32(&mut s) as usize;
     let mut name = vec![0u8; name_len];
     s.read_exact(&mut name).unwrap();
-    assert!(name_len >= 22, "expected extended ServerInit, got {name_len}");
+    assert!(
+        name_len >= 22,
+        "expected extended ServerInit, got {name_len}"
+    );
     assert_eq!(&name[..2], &[0, 0]);
     let flags = u32::from_be_bytes([name[2], name[3], name[4], name[5]]);
     assert_ne!(flags & 0x10, 0, "extended flag missing: {flags:#x}");
@@ -369,7 +442,8 @@ fn apple_session_starts_encrypted_record_layer() {
     // Enable shared pasteboard (0x15 selector 1) and fetch with echo 42.
     // No SetEncodings yet: the pusher waits for it, so no framebuffer records
     // can interleave with the clipboard reply.
-    s.write_all(&enc.seal(&[0x15, 0, 0, 1, 0, 0, 0, 0])).unwrap();
+    s.write_all(&enc.seal(&[0x15, 0, 0, 1, 0, 0, 0, 0]))
+        .unwrap();
     let mut fetch = vec![0x0bu8, 0, 0, 0];
     fetch.extend_from_slice(&42u32.to_be_bytes());
     s.write_all(&enc.seal(&fetch)).unwrap();
@@ -421,7 +495,93 @@ fn apple_session_starts_encrypted_record_layer() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(applied, "client pasteboard did not reach the host clipboard");
+    assert!(
+        applied,
+        "client pasteboard did not reach the host clipboard"
+    );
+
+    // --- file upload: Mac -> Windows ---
+    let upload_session = 7u32;
+    let upload_name = "upload from mac.txt";
+    let upload_bytes = b"hello uploaded file";
+    let mut messages = Vec::new();
+    messages.push(file_frame(2, upload_session, &start_body("/")));
+    messages.push(file_frame(
+        100,
+        upload_session,
+        &item_info_body(upload_bytes.len() as u64),
+    ));
+    messages.push(file_frame(
+        101,
+        upload_session,
+        &new_item_body(upload_name, upload_bytes.len() as u64),
+    ));
+    let mut data_body = Vec::new();
+    data_body.extend_from_slice(&(upload_bytes.len() as u32).to_be_bytes());
+    data_body.extend_from_slice(upload_bytes);
+    messages.push(file_frame(102, upload_session, &data_body));
+    messages.push(file_frame(104, upload_session, &0i32.to_le_bytes()));
+    for message in messages {
+        s.write_all(&enc.seal(&message)).unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut uploaded_name = None;
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.first() != Some(&0x22) {
+            continue;
+        }
+        let (command, session, payload) = parse_file_frame(&body);
+        if session != upload_session || command != 200 {
+            continue;
+        }
+        assert_eq!(i16::from_be_bytes(payload[0..2].try_into().unwrap()), 0);
+        let name_len = u16::from_be_bytes(payload[2..4].try_into().unwrap()) as usize;
+        uploaded_name = Some(String::from_utf8_lossy(&payload[4..4 + name_len]).into_owned());
+        break;
+    }
+    let uploaded_name = uploaded_name.expect("upload did not finish");
+    let uploaded = std::fs::read(share_dir.join(&uploaded_name)).expect("uploaded file");
+    assert_eq!(uploaded, upload_bytes);
+
+    // --- file download: Windows -> Mac ---
+    std::fs::write(share_dir.join("download.txt"), b"hello downloaded file").unwrap();
+    let download_session = 8u32;
+    s.write_all(&enc.seal(&file_frame(
+        1,
+        download_session,
+        &start_body("/download.txt"),
+    )))
+    .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut downloaded = Vec::new();
+    let mut saw_end = false;
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.first() != Some(&0x22) {
+            continue;
+        }
+        let (command, session, payload) = parse_file_frame(&body);
+        if session != download_session {
+            continue;
+        }
+        match command {
+            102 => {
+                let len = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
+                downloaded.extend_from_slice(&payload[4..4 + len]);
+            }
+            104 => {
+                assert_eq!(i32::from_le_bytes(payload[0..4].try_into().unwrap()), 0);
+                saw_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_end, "download did not end");
+    assert_eq!(downloaded, b"hello downloaded file");
 
     // --- framebuffer: negotiate encodings and wait for a pushed update ---
     let mut set_encodings = vec![2u8, 0];
