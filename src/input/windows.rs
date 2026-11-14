@@ -31,10 +31,17 @@ impl WinInput {
             return;
         }
 
-        // Direct Unicode keysyms: inject via KEYEVENTF_UNICODE (layout-safe).
-        if let Some(ch) = ks::unicode_codepoint(keysym) {
-            send_unicode(ch, down);
-            return;
+        // Punctuation, accented letters and direct Unicode keysyms are
+        // injected as the exact character via KEYEVENTF_UNICODE (layout-safe,
+        // bypasses the host IME — a Chinese IME would otherwise rewrite a
+        // virtual "/" key into "、"). While Ctrl or Alt is held, characters
+        // that do have a virtual key keep the VK path so application chords
+        // like Ctrl+/ or Alt+. still work.
+        if let Some(ch) = ks::injection_char(keysym) {
+            if !(ch.is_ascii_punctuation() && ctrl_or_alt_held()) {
+                send_unicode(ch, down);
+                return;
+            }
         }
 
         let Some(vk) = keysym_vk(keysym) else {
@@ -101,6 +108,17 @@ pub fn enable_dpi_awareness() {
 }
 
 // --- keyboard ---------------------------------------------------------------
+
+/// True while Ctrl or Alt is held on the host (including presses injected
+/// from client modifier events). Used to keep punctuation on the virtual-key
+/// path while a chord is in progress.
+fn ctrl_or_alt_held() -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_MENU};
+    unsafe {
+        GetAsyncKeyState(VK_CONTROL.0 as i32) as u16 & 0x8000 != 0
+            || GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000 != 0
+    }
+}
 
 fn send_vk(vk: u16, down: bool) {
     use windows::Win32::Foundation::LPARAM;
@@ -173,6 +191,12 @@ fn send_unicode(ch: char, down: bool) {
 }
 
 /// keysym -> Windows virtual-key code.
+///
+/// Alphanumeric and function/navigation keysyms map to virtual keys so
+/// modifier chords (Ctrl+C, Alt+F4, Shift+arrow) keep working. Everything
+/// else — punctuation and non-ASCII characters — is injected as Unicode by
+/// [`WinInput::key`] before this table is consulted; the OEM punctuation
+/// entries below remain as a fallback for the Ctrl/Alt-chord case.
 pub fn keysym_vk(keysym: u32) -> Option<u16> {
     use crate::rfb::keysym as ks;
     // Printable ASCII: letters map to their uppercase VK, punctuation to OEM VKs.
@@ -323,5 +347,18 @@ mod tests {
         assert_eq!(keysym_vk(ks::F1), Some(0x70));
         assert_eq!(keysym_vk(ks::KP_ADD), Some(0x6B));
         assert_eq!(keysym_vk(ks::SUPER_L), Some(0x5B));
+    }
+
+    #[test]
+    fn shifted_punctuation_routes_to_unicode_injection() {
+        // Shifted punctuation has no virtual key of its own; before the
+        // Unicode route these keysyms were silently dropped.
+        for ch in ['*', '(', '{', '"', '!', '@', '#', '%', '&', '_', '+', '|', ':', '<', '>', '?'] {
+            assert_eq!(ks::injection_char(ch as u32), Some(ch), "failed for {ch:?}");
+        }
+        // "/" does map to an OEM VK, but is normally injected as Unicode so
+        // the host keyboard layout / IME cannot rewrite it.
+        assert_eq!(keysym_vk('/' as u32), Some(0xBF));
+        assert_eq!(ks::injection_char('/' as u32), Some('/'));
     }
 }

@@ -59,3 +59,70 @@ pub fn unicode_codepoint(keysym: u32) -> Option<char> {
         None
     }
 }
+
+/// Returns the exact character a keysym stands for, for keysyms the platform
+/// backend should inject as a character (e.g. `KEYEVENTF_UNICODE`) instead of
+/// a virtual key:
+///
+/// * direct Unicode keysyms (`0x01000000 + codepoint`),
+/// * Latin-1 keysyms `0xA0..=0xFF` (identity mapping to codepoints),
+/// * printable ASCII punctuation — including shifted forms like `* ( { "` —
+///   which have no virtual-key of their own (they need Shift on the host
+///   layout) and are routed through the host IME if sent as virtual keys.
+///
+/// Letters, digits and space return `None` so they keep the virtual-key path
+/// and modifier chords (Ctrl+C, Alt+1) keep working.
+pub fn injection_char(keysym: u32) -> Option<char> {
+    if let Some(ch) = unicode_codepoint(keysym) {
+        return Some(ch);
+    }
+    if (0xA0..=0xFF).contains(&keysym) {
+        return char::from_u32(keysym);
+    }
+    if (0x20..=0x7E).contains(&keysym) {
+        let ch = keysym as u8 as char;
+        if !ch.is_ascii_alphanumeric() && ch != ' ' {
+            return Some(ch);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn injection_char_covers_punctuation() {
+        // Characters reported as untypable over RFB: "/" needs no shift but
+        // must not go through the host IME, the rest have no VK at all.
+        for ch in ['/', '"', '{', '*', '(', '!', '?', '<', '>', '|', ':', '~', '+', '_'] {
+            assert_eq!(injection_char(ch as u32), Some(ch), "failed for {ch:?}");
+        }
+    }
+
+    #[test]
+    fn injection_char_keeps_vks_for_alphanumerics() {
+        // Letters, digits and space stay on the virtual-key path so
+        // modifier chords (Ctrl+C, Alt+1, Ctrl+Space) keep working.
+        assert_eq!(injection_char(b'a' as u32), None);
+        assert_eq!(injection_char(b'A' as u32), None);
+        assert_eq!(injection_char(b'7' as u32), None);
+        assert_eq!(injection_char(b' ' as u32), None);
+        // Control keysyms are not characters.
+        assert_eq!(injection_char(RETURN), None);
+        assert_eq!(injection_char(SHIFT_L), None);
+    }
+
+    #[test]
+    fn injection_char_covers_latin1_and_direct_unicode() {
+        assert_eq!(injection_char(0xE9), Some('é')); // Latin-1 keysym
+        assert_eq!(injection_char(0xFC), Some('ü'));
+        assert_eq!(injection_char(0x0100_2026), Some('\u{2026}')); // direct Unicode keysym (…)
+        assert_eq!(injection_char(0x0101_F600), Some('\u{1F600}')); // 😀
+        // Raw codepoints below the 0x01000000 Unicode base are not valid
+        // keysym encodings (0x2026 is not "…" on the wire).
+        assert_eq!(injection_char(0x2026), None);
+        assert_eq!(injection_char(0x3000), None);
+    }
+}
