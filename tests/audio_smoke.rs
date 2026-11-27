@@ -97,6 +97,11 @@ fn server_alive() -> bool {
         .unwrap_or(true)
 }
 
+/// Non-panicking variant used from the panic hook.
+fn server_alive_probe() -> bool {
+    server_alive()
+}
+
 fn dump_server_log(path: &std::path::Path) {
     if let Ok(text) = std::fs::read_to_string(path) {
         let tail: Vec<&str> = text.lines().rev().take(12).collect();
@@ -119,6 +124,20 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
     std::fs::create_dir_all(&work).unwrap();
     let share_dir = work.join("share");
     let stderr_log = work.join("server.err.log");
+    // Dump the server's stderr on ANY test failure: the audio capture or
+    // encoder can take the process down natively (no Rust panic), and the
+    // stderr is the only way to see how far startup got.
+    let hook_log = stderr_log.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        println!("panic: {info}");
+        println!("server process alive: {}", server_alive_probe());
+        if let Ok(text) = std::fs::read_to_string(&hook_log) {
+            println!("--- server stderr ({} bytes) ---", text.len());
+            println!("{text}");
+        } else {
+            println!("--- server stderr: <unavailable> ---");
+        }
+    }));
     let child = Command::new(env!("CARGO_BIN_EXE_restsend-vnc"))
         .args([
             "--test-pattern",
