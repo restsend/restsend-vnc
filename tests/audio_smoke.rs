@@ -194,6 +194,24 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
         Duration::from_secs(12),
     );
     if status == 0 && !server_alive() {
+        // Report everything useful before panicking: the process exit code,
+        // the last Application-log crash event, and the server's stderr.
+        if let Ok(Some(status_info)) = child.try_wait() {
+            println!("server exit status: {status_info}");
+        } else {
+            println!("server still running per handle (tasklist disagreed)");
+        }
+        if let Ok(out) = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000,1001} -MaxEvents 2 -ErrorAction SilentlyContinue | ForEach-Object { $_.TimeCreated.ToString() + ' :: ' + $_.Message.Substring(0, [Math]::Min(300, $_.Message.Length)) }",
+            ])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            println!("--- last Application error events ---\n{text}");
+        }
         dump_server_log(&stderr_log);
         panic!(
             "server process died before the stream request (capture/encoder crash on this SKU)"
