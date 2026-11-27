@@ -2,8 +2,10 @@
 //!
 //! The audio HTTP endpoint must serve the token-gated index page on plain
 //! HTTP, reject wrong tokens, and stream (or cleanly 503 when the runner has
-//! no audio capture device). Playback itself is the browser's job; this test
-//! only exercises the server side.
+//! no audio capture device / its Media Foundation stack cannot encode).
+//! Playback itself is the browser's job; this test only exercises the server
+//! side. The server's stderr is captured and reported on failure so a
+//! capture/encoder crash is visible in CI.
 
 #![cfg(target_os = "windows")]
 
@@ -46,14 +48,20 @@ fn connect_retry(port: u16) -> TcpStream {
 
 /// Performs one HTTP/1.1 GET and returns (status_code, headers, body_head).
 fn http_get(port: u16, path: &str, read_for: Duration) -> (u16, String, Vec<u8>) {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut s = match TcpStream::connect(("127.0.0.1", port)) {
+        Ok(s) => s,
+        Err(_) => return (0, String::new(), Vec::new()),
+    };
     s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
     s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
-    write!(
+    if write!(
         s,
         "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     )
-    .unwrap();
+    .is_err()
+    {
+        return (0, String::new(), Vec::new());
+    }
     let deadline = Instant::now() + read_for;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -67,7 +75,9 @@ fn http_get(port: u16, path: &str, read_for: Duration) -> (u16, String, Vec<u8>)
             break;
         }
     }
-    let text_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(0);
+    let Some(text_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return (0, String::new(), buf);
+    };
     let head = String::from_utf8_lossy(&buf[..text_end]).to_string();
     let status: u16 = head
         .lines()
@@ -78,16 +88,37 @@ fn http_get(port: u16, path: &str, read_for: Duration) -> (u16, String, Vec<u8>)
     (status, head, buf[buf.len().min(text_end + 4)..].to_vec())
 }
 
+fn server_alive() -> bool {
+    // The spawned binary is restsend-vnc.exe (console build).
+    !std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq restsend-vnc.exe", "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("restsend-vnc"))
+        .unwrap_or(true)
+}
+
+fn dump_server_log(path: &std::path::Path) {
+    if let Ok(text) = std::fs::read_to_string(path) {
+        let tail: Vec<&str> = text.lines().rev().take(12).collect();
+        println!("--- server stderr tail ---");
+        for line in tail.iter().rev() {
+            println!("{line}");
+        }
+    }
+}
+
 #[test]
 fn audio_http_endpoint_serves_page_and_gates_tokens() {
     let vnc_port = free_port();
     let audio_port = free_port();
-    let share_dir = std::env::temp_dir().join(format!(
-        "restsend-vnc-audio-share-{}-{}",
+    let work = std::env::temp_dir().join(format!(
+        "restsend-vnc-audio-test-{}-{}",
         std::process::id(),
         vnc_port
     ));
-    std::fs::create_dir_all(&share_dir).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    let share_dir = work.join("share");
+    let stderr_log = work.join("server.err.log");
     let child = Command::new(env!("CARGO_BIN_EXE_restsend-vnc"))
         .args([
             "--test-pattern",
@@ -110,7 +141,7 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
         .env("RUST_LOG", "restsend_vnc=info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&stderr_log).unwrap()))
         .spawn()
         .expect("spawn restsend-vnc");
     let _guard = KillOnDrop(child);
@@ -131,9 +162,18 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
     );
 
     // Stream endpoint: either a live stream (Content-Type: audio/*) or a
-    // clean 503 when the machine has no capture device.
+    // clean 503 when the machine has no capture device. A dead server is
+    // reported with its stderr tail: on runner SKUs without a usable Media
+    // Foundation stack the capture thread can take the process down, which
+    // this test records instead of masking.
     let (status, head, body) =
         http_get(audio_port, "/tokentokentoken/stream", Duration::from_secs(6));
+    if status == 0 && !server_alive() {
+        dump_server_log(&stderr_log);
+        panic!(
+            "server process died before the stream request (capture/encoder crash on this SKU)"
+        );
+    }
     let content_type = head
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
@@ -149,8 +189,12 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
             "live stream must deliver data immediately after the header"
         );
     } else {
-        assert_eq!(status, 503, "stream status must be 200 or 503, got {status}");
+        assert!(
+            status == 503,
+            "stream status must be 200 or 503, got {status} (server alive: {})",
+            server_alive()
+        );
     }
 
-    let _ = std::fs::remove_dir_all(&share_dir);
+    let _ = std::fs::remove_dir_all(&work);
 }
