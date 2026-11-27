@@ -139,7 +139,7 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
             println!("--- server stderr: <unavailable> ---");
         }
     }));
-    let child = Command::new(env!("CARGO_BIN_EXE_restsend-vnc"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_restsend-vnc"))
         .args([
             "--test-pattern",
             "--no-auth",
