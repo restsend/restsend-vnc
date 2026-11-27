@@ -16,6 +16,12 @@ use std::time::{Duration, Instant};
 
 struct KillOnDrop(Child);
 
+impl KillOnDrop {
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.try_wait()
+    }
+}
+
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -164,7 +170,7 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
         .stderr(Stdio::from(std::fs::File::create(&stderr_log).unwrap()))
         .spawn()
         .expect("spawn restsend-vnc");
-    let _guard = KillOnDrop(child);
+    let mut guard = KillOnDrop(child);
 
     connect_retry(audio_port);
 
@@ -196,7 +202,7 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
     if status == 0 && !server_alive() {
         // Report everything useful before panicking: the process exit code,
         // the last Application-log crash event, and the server's stderr.
-        if let Ok(Some(status_info)) = child.try_wait() {
+        if let Ok(Some(status_info)) = guard.try_wait() {
             println!("server exit status: {status_info}");
         } else {
             println!("server still running per handle (tasklist disagreed)");
