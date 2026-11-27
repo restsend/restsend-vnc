@@ -394,10 +394,12 @@ fn run_capture_session(stop: &Arc<AtomicBool>) -> Result<(), String> {
             .Activate::<IAudioClient>(CLSCTX_ALL, None)
             .map_err(|e| e.to_string())?;
         let fmt = client.GetMixFormat().map_err(|e| e.to_string())?;
-        let (rate, channels, is_float) = parse_format(fmt);
+        let (rate, channels, sample_fmt, src_block_align) = parse_format(fmt);
         if rate == 0 || channels == 0 || channels > 8 {
             CoTaskMemFree(Some(fmt as *const core::ffi::c_void));
-            return Err(format!("unsupported mix format (rate={rate} ch={channels})"));
+            return Err(format!(
+                "unsupported mix format (rate={rate} ch={channels} fmt={sample_fmt:?})"
+            ));
         }
         client
             .Initialize(
@@ -459,21 +461,18 @@ fn run_capture_session(stop: &Arc<AtomicBool>) -> Result<(), String> {
                     .GetBuffer(&mut data, &mut frames, &mut flags, None, None)
                     .map_err(|e| e.to_string())?;
                 if frames > 0 {
-                    let byte_len = frames as usize * bytes_per_frame;
-                    let mut pcm = vec![0u8; byte_len];
+                    // WASAPI hands us `frames` frames in the device's own
+                    // stride; never read more than that (a 24-bit or 32-bit
+                    // device has a wider stride than our 16-bit output).
+                    let src_len = frames as usize * src_block_align;
+                    let pcm_len = frames as usize * bytes_per_frame;
+                    let mut pcm = vec![0u8; pcm_len];
                     if !data.is_null() {
                         if flags & wasapi::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
                             // pcm stays zeroed
-                        } else if is_float {
-                            let src = std::slice::from_raw_parts(data, byte_len);
-                            for (i, sample) in src.chunks_exact(4).enumerate() {
-                                let v = f32::from_le_bytes(sample.try_into().unwrap());
-                                let clamped = v.clamp(-1.0, 1.0);
-                                let s = (clamped * 32767.0) as i16;
-                                pcm[i * 2..i * 2 + 2].copy_from_slice(&s.to_le_bytes());
-                            }
                         } else {
-                            pcm.copy_from_slice(std::slice::from_raw_parts(data, byte_len));
+                            let src = std::slice::from_raw_parts(data, src_len);
+                            convert_samples(src, &mut pcm, channels as usize, sample_fmt);
                         }
                     }
                     for chunk in encoder.push(&pcm) {
@@ -491,34 +490,111 @@ fn run_capture_session(stop: &Arc<AtomicBool>) -> Result<(), String> {
     }
 }
 
-/// Reads rate/channels/float-ness from a WAVEFORMATEX (or EXTENSIBLE).
+/// Sample encodings a WASAPI mix format can realistically use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SampleFmt {
+    /// 32-bit IEEE float (the usual shared-mode mix format).
+    F32,
+    /// 16-bit signed PCM.
+    I16,
+    /// 24-bit signed PCM (3 bytes per sample, little-endian).
+    I24,
+    /// 32-bit signed PCM.
+    I32,
+}
+
+/// Reads rate/channels/sample-format/source stride from a WAVEFORMATEX (or
+/// EXTENSIBLE). Returns zero rate when the format is not one we can convert,
+/// which disables capture gracefully instead of reading out of bounds.
 unsafe fn parse_format(
     fmt: *mut windows::Win32::Media::Audio::WAVEFORMATEX,
-) -> (u32, u16, bool) {
+) -> (u32, u16, SampleFmt, usize) {
     use windows::core::GUID;
+    const UNSUPPORTED: (u32, u16, SampleFmt, usize) = (0, 0, SampleFmt::F32, 0);
     if fmt.is_null() {
-        return (0, 0, false);
+        return UNSUPPORTED;
     }
     let base = &*fmt;
-    let tag = base.wFormatTag;
-    if tag == 0xFFFE {
-        // WAVE_FORMAT_EXTENSIBLE: inspect the SubFormat GUID.
-        const FLOAT_GUID: u128 = 0x0000_0003_0000_0010_8000_00aa_0038_9b71;
-        const PCM_GUID: u128 = 0x0000_0001_0000_0010_8000_00aa_0038_9b71;
-        let ext = fmt as *const windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE;
-        if ext.is_null() {
-            return (0, 0, false);
+    let (sample_fmt, src_block_align) = match base.wFormatTag {
+        0xFFFE => {
+            // WAVE_FORMAT_EXTENSIBLE: inspect the SubFormat GUID and the
+            // declared valid bit depth.
+            const FLOAT_GUID: u128 = 0x0000_0003_0000_0010_8000_00aa_0038_9b71;
+            const PCM_GUID: u128 = 0x0000_0001_0000_0010_8000_00aa_0038_9b71;
+            let ext = fmt as *const windows::Win32::Media::Audio::WAVEFORMATEXTENSIBLE;
+            if ext.is_null() {
+                return UNSUPPORTED;
+            }
+            let sub = (*ext).SubFormat;
+            let bits = (*ext).Samples.wValidBitsPerSample;
+            let kind = if sub == GUID::from_u128(FLOAT_GUID) {
+                Some(SampleFmt::F32)
+            } else if sub == GUID::from_u128(PCM_GUID) {
+                match bits {
+                    16 => Some(SampleFmt::I16),
+                    24 => Some(SampleFmt::I24),
+                    32 => Some(SampleFmt::I32),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            match kind {
+                Some(k) => (k, base.nBlockAlign as usize),
+                None => return UNSUPPORTED,
+            }
         }
-        let sub = (*ext).SubFormat;
-        if sub == GUID::from_u128(FLOAT_GUID) {
-            return (base.nSamplesPerSec, base.nChannels, true);
+        3 => (SampleFmt::F32, base.nBlockAlign as usize),
+        1 => match base.wBitsPerSample {
+            16 => (SampleFmt::I16, base.nBlockAlign as usize),
+            24 => (SampleFmt::I24, base.nBlockAlign as usize),
+            32 => (SampleFmt::I32, base.nBlockAlign as usize),
+            _ => return UNSUPPORTED,
+        },
+        _ => return UNSUPPORTED,
+    };
+    (base.nSamplesPerSec, base.nChannels, sample_fmt, src_block_align)
+}
+
+/// Converts one WASAPI capture packet into interleaved 16-bit LE PCM.
+///
+/// `src` holds exactly `frames * src_block_align` bytes in `sample_fmt`;
+/// `dst` is `frames * channels * 2` bytes of output.
+fn convert_samples(src: &[u8], dst: &mut [u8], channels: usize, sample_fmt: SampleFmt) {
+    let frames = dst.len() / (channels * 2);
+    let mut write_sample = |i: usize, s: i16| {
+        if i * 2 + 2 <= dst.len() {
+            dst[i * 2..i * 2 + 2].copy_from_slice(&s.to_le_bytes());
         }
-        if sub == GUID::from_u128(PCM_GUID) {
-            return (base.nSamplesPerSec, base.nChannels, false);
+    };
+    match sample_fmt {
+        SampleFmt::F32 => {
+            for (i, sample) in src.chunks_exact(4).take(frames * channels).enumerate() {
+                let v = f32::from_le_bytes(sample.try_into().unwrap());
+                write_sample(i, (v.clamp(-1.0, 1.0) * 32767.0) as i16);
+            }
         }
-        return (0, 0, false);
+        SampleFmt::I16 => {
+            for (i, sample) in src.chunks_exact(2).take(frames * channels).enumerate() {
+                write_sample(i, i16::from_le_bytes(sample.try_into().unwrap()));
+            }
+        }
+        SampleFmt::I24 => {
+            for (i, sample) in src.chunks_exact(3).take(frames * channels).enumerate() {
+                // 24-bit little-endian sample; sign-extend via shifts and
+                // scale down to 16 bits.
+                let v = (sample[0] as i32) | ((sample[1] as i32) << 8) | ((sample[2] as i32) << 16);
+                write_sample(i, ((v << 8) >> 16) as i16);
+            }
+        }
+        SampleFmt::I32 => {
+            for (i, sample) in src.chunks_exact(4).take(frames * channels).enumerate() {
+                let v = i32::from_le_bytes(sample.try_into().unwrap());
+                write_sample(i, (v >> 16) as i16);
+            }
+        }
     }
-    (base.nSamplesPerSec, base.nChannels, tag == 3)
+    let _ = frames;
 }
 
 /// Minimal 44-byte streaming WAV header (unknown data size).
