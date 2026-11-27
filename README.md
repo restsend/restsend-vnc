@@ -10,6 +10,8 @@ Works with standard VNC viewers and with macOS built-in Screen Sharing.
 - Encodings: Raw / Hextile / ZRLE (zlib-rs + SSSE3 + packed palette)
 - Standard clipboard sync, both directions (text)
 - Rich ARD clipboard for macOS Screen Sharing (text), carried over the encrypted ARD control channel
+- **Send files to the Mac**: tray panel queues files and pushes them to Screen Sharing as pasteboard file promises; the Mac resolves them with ⌘V in Finder and downloads via the ARD `0x22` channel (works for files outside the shared folder too, with per-transfer progress in the panel)
+- **Audio streaming**: WASAPI loopback → Media Foundation AAC (raw-WAV fallback) served over a token-protected HTTP port; open the copied URL in Safari/Chrome/VLC on the Mac to hear this PC — no HTTPS, no client install
 - TLS via VeNCrypt (RFB security type 19, X509None/X509Vnc subtypes), self-signed certificate generated on first use; works with TigerVNC and other VeNCrypt viewers
 - File transfer via Tight extensions (upload/download/resume/mkdir), off by default and sandboxed to the configured shared folder (defaults to your user directory)
 - ARD file transfer for macOS Screen Sharing (`0x22`), off by default and sandboxed to the same folder: drag files into the session to upload them. Windows→Mac file paste is experimental (Screen Sharing's file-promise handling varies by version)
@@ -56,10 +58,31 @@ Default listen address is `0.0.0.0`. Enable **Only accept loopback connections**
 | TigerVNC | ✅ | ✅ (standard text clipboard) | ❌ | ✅ VeNCrypt (accept the self-signed prompt) |
 | RealVNC Viewer | ✅ | ✅ (standard text clipboard) | ❌ | ⚠️ depends on version; use auto mode |
 | TightVNC / UltraVNC | ✅ | ✅ (standard text clipboard) | ✅ Tight extension | ❌ no VeNCrypt; use `--tls off` or auto mode |
-| macOS built-in Screen Sharing | ✅ | ✅ text over the ARD control channel | ✅ drag & drop upload (ARD `0x22`); Windows→Mac paste experimental | ❌ not supported; use auto mode |
+| macOS built-in Screen Sharing | ✅ | ✅ text over the ARD control channel | ✅ drag & drop upload (ARD `0x22`); ✅ server → Mac via the tray **Send file** panel (⌘V in Finder to save) | ❌ not supported; use auto mode |
 
 File transfer requires **Share files** to be enabled; both the Tight and ARD
-paths are sandboxed to the same configured folder.
+paths are sandboxed to the same configured folder, except files queued in the
+Send-file panel, which are offered explicitly by the local user.
+
+## Sending files to the Mac
+
+Tray → **Send file to Mac viewer...**: add files, press **Send**. The server
+advertises them as `public.file-url` pasteboard items over the encrypted ARD
+channel; Screen Sharing puts file promises on the Mac clipboard and the
+transfer runs through Apple's `0x22` file channel the moment you press
+**⌘V in Finder** (or any folder). The panel shows each fetch and transfer.
+Requires **Share files** to be enabled; the queued files may live anywhere —
+the offer, not the shared folder, is what authorizes them.
+
+## Listening to this PC from the Mac
+
+VNC/ARD has no audio channel, so restsend-vnc serves system audio on a side
+HTTP port instead: Settings → General → **Stream system audio**, then tray →
+**Copy audio stream URL** and open it on the Mac (Safari/Chrome/VLC, plain
+HTTP). The URL contains a random per-run token, honours **loopback-only** and
+the CIDR allow-list, and keeps playing in background tabs. Latency is
+web-radio class (~0.5–1 s); AAC is served via Media Foundation with a raw-WAV
+fallback when the encoder is unavailable.
 
 ## Configuration
 
@@ -69,7 +92,8 @@ paths are sandboxed to the same configured folder.
 - Connection confirmation is **off by default**. Enable **Ask before accepting incoming connections** on the Security tab (or pass `--confirm`) to require a local Accept click for each new connection. The prompt appears after authentication and before `ServerInit`; rejected, timed-out (30 s) or unattended requests are closed without sending any screen data. At most 4 requests are queued; further connections are refused. Use `--no-confirm` to override the persisted setting for one run
 - The **Allowed networks (CIDR)** field on the Security tab restricts incoming peers. Entries are comma or space separated (`192.168.1.0/24, 10.0.0.0/8`); a bare address means a single host. Leave it empty to allow all. Loopback is **not** implicit, so add `127.0.0.1/32` if local viewers must connect. Invalid entries are rejected when saving; a hand-edited invalid list fails closed. The rule applies to new connections immediately (`--allow-cidrs LIST` overrides it for one run)
 - **View only** on the General tab makes new sessions display-only: keyboard, mouse, clipboard and file uploads are disabled. `--view-only` forces it for one run and `--no-view-only` overrides a persisted `view_only=1`. Existing sessions keep the mode they were opened with
-- Common flags: `--port`, `--password`, `--host`, `--allow-cidrs`, `--color-level 8|16|24`, `--fps`, `--scale`, `--share-dir`, `--debug`, `--tls`, `--confirm`, `--no-confirm`, `--view-only`, `--no-view-only`
+- **Audio streaming** (General tab): enable and pick the port (default 5901). The tray menu **Copy audio stream URL** puts `http://<lan-ip>:<port>/<token>/` on the clipboard (it reaches the Mac through the shared clipboard too). `--audio` / `--no-audio` / `--audio-port <PORT>` override the persisted setting for one run; changes apply immediately
+- Common flags: `--port`, `--password`, `--host`, `--allow-cidrs`, `--color-level 8|16|24`, `--fps`, `--scale`, `--share-dir`, `--debug`, `--tls`, `--confirm`, `--no-confirm`, `--view-only`, `--no-view-only`, `--audio`, `--no-audio`, `--audio-port`
 
 ## TLS / VeNCrypt
 
@@ -132,8 +156,8 @@ about 3.8 MB (down from 4.9 MB with thin LTO).
 - The capture session is recreated after lock/unlock and after sleep/hibernate resume, because Windows.Graphics.Capture resumes without its yellow screen-sharing border
 - Apple/ARD clients (macOS Screen Sharing) use the server-composited pointer: the server hides the client's local pointer and draws/erases its own, because Screen Sharing's local cursor leaves old cursors behind during full-frame updates. Other viewers use the zero-traffic client-side Rich Cursor; `RESTSEND_VNC_CURSOR_SERVER=1` forces the composited overlay for them, and `RESTSEND_VNC_CURSOR_ALPHA=1` opts Apple clients into CursorAlpha (1104) for protocol testing
 - Connection confirmation fails closed: a console build prompts on stdin, and rejects the connection when no terminal/UI is available
-- Internal test hooks: `RESTSEND_VNC_APPROVAL=accept|reject|timeout`, `RESTSEND_VNC_APPROVAL_TIMEOUT_MS`, and `RESTSEND_VNC_ALLOW_MULTIPLE=1` (bypass the single-instance mutex) are used by the integration tests. `RESTSEND_VNC_CLIPBOARD_FILE=<path>` substitutes a file for the host clipboard (headless tests), `RESTSEND_VNC_APPLE_NO_EXT=1` disables the extended ARD ServerInit and `RESTSEND_VNC_APPLE_NO_ENC=1` keeps Apple frames plaintext for protocol diagnosis
-- macOS Screen Sharing shares its pasteboard only over the encrypted ARD control channel: text works in both directions, and copied files are advertised as `public.file-url` items so the Mac can fetch them through the ARD file channel
+- Internal test hooks: `RESTSEND_VNC_APPROVAL=accept|reject|timeout`, `RESTSEND_VNC_APPROVAL_TIMEOUT_MS`, `RESTSEND_VNC_ALLOW_MULTIPLE=1` (bypass the single-instance mutex), `RESTSEND_VNC_OFFER_FILE=<path>` (pre-load a send-file offer), and `RESTSEND_VNC_AUDIO_TOKEN=<token>` (pin the audio URL token). `RESTSEND_VNC_CLIPBOARD_FILE=<path>` substitutes a file for the host clipboard (headless tests), `RESTSEND_VNC_APPLE_NO_EXT=1` disables the extended ARD ServerInit and `RESTSEND_VNC_APPLE_NO_ENC=1` keeps Apple frames plaintext for protocol diagnosis
+- macOS Screen Sharing shares its pasteboard only over the encrypted ARD control channel: text works in both directions, and files offered by the Send-file panel are advertised as `public.file-url` items so the Mac can fetch them through the ARD file channel
 - The debug overlay's `CLI` line ends in `[TLS]` or `[PLAIN]` so the live link's encryption is visible
 - Windows pointer trails are disabled only while a capture session is active (and restored on stop), because some Windows builds composite the trail ghosts into the captured frame and they appear as dark dots behind fast pointer movement
 - The password is stored in plain text in `settings.ini`

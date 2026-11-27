@@ -796,11 +796,22 @@ pub fn local_path_from_request(request: &str) -> Option<PathBuf> {
         }
     }
     let text = percent_decode(&text);
-    let text = text.strip_prefix('/').unwrap_or(&text).replace('/', "\\");
-    let drive_absolute =
-        text.len() >= 3 && text.as_bytes()[1] == b':' && text.as_bytes()[0].is_ascii_alphabetic();
-    let path = PathBuf::from(text);
-    if path.is_absolute() || drive_absolute {
+    let path = if cfg!(target_os = "windows") {
+        // `/C:/...` -> `C:\...`; native separators for PathBuf.
+        let text = text.strip_prefix('/').unwrap_or(&text).replace('/', "\\");
+        let drive_absolute = text.len() >= 3
+            && text.as_bytes()[1] == b':'
+            && text.as_bytes()[0].is_ascii_alphabetic();
+        let path = PathBuf::from(text);
+        if path.is_absolute() || drive_absolute {
+            return Some(path);
+        }
+        return None;
+    } else {
+        // POSIX: keep the absolute path as-is.
+        PathBuf::from(text)
+    };
+    if path.is_absolute() {
         Some(path)
     } else {
         None
@@ -1081,7 +1092,8 @@ mod tests {
     }
 
     #[test]
-    fn local_path_from_url() {
+    #[cfg(target_os = "windows")]
+    fn local_path_from_url_windows() {
         assert_eq!(
             local_path_from_request("file:///C:/Users/pi/a%20b.txt"),
             Some(PathBuf::from("C:\\Users\\pi\\a b.txt"))
@@ -1089,6 +1101,19 @@ mod tests {
         assert_eq!(
             local_path_from_request("/C:/Users/pi/a.txt"),
             Some(PathBuf::from("C:\\Users\\pi\\a.txt"))
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn local_path_from_url_posix() {
+        assert_eq!(
+            local_path_from_request("file:///Users/pi/a%20b.txt"),
+            Some(PathBuf::from("/Users/pi/a b.txt"))
+        );
+        assert_eq!(
+            local_path_from_request("/Users/pi/a.txt"),
+            Some(PathBuf::from("/Users/pi/a.txt"))
         );
     }
 }

@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use windows::core::{w, PCWSTR, PWSTR};
@@ -45,6 +46,8 @@ const ID_KILL: usize = 2;
 const ID_OPEN: usize = 3;
 const ID_ABOUT: usize = 4;
 const ID_EXIT: usize = 5;
+const ID_SEND: usize = 6;
+const ID_AUDIO_URL: usize = 7;
 
 const C_PORT: i32 = 1001;
 const C_COLOR: i32 = 1002;
@@ -64,17 +67,34 @@ const C_CONFIRM: i32 = 1015;
 const C_ALLOW: i32 = 1016;
 const C_VIEWONLY: i32 = 1017;
 const C_PASS_SHOW: i32 = 1018;
+const C_AUDIO: i32 = 1019;
 const C_TABS: i32 = 1020;
+const C_AUDIO_PORT: i32 = 1021;
 
 const C_CC_COUNT: i32 = 1031;
 const C_CC_ACCEPT: i32 = 1032;
 const C_CC_REJECT: i32 = 1033;
+
+// Send-files panel controls.
+const C_SF_LIST: i32 = 1040;
+const C_SF_ADD: i32 = 1041;
+const C_SF_REMOVE: i32 = 1042;
+const C_SF_SEND: i32 = 1043;
+const C_SF_CLEAR: i32 = 1044;
+const C_SF_STATUS: i32 = 1045;
+const C_SF_LOG: i32 = 1046;
 
 static UI_FONT: AtomicIsize = AtomicIsize::new(0);
 /// Non-zero while the settings window is open (prevents nested duplicates).
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Non-zero while the confirmation window is on screen.
 static CONFIRM_ID: AtomicU64 = AtomicU64::new(0);
+/// Non-zero while the send-files panel is open (single instance).
+static SEND_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Files queued in the send-files panel.
+static SEND_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+/// Last log line count rendered into the panel (refresh aid).
+static SEND_LOG_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 thread_local! {
     /// Control handles per settings tab, stored as `isize` because `HWND`
@@ -184,9 +204,30 @@ unsafe extern "system" fn tray_proc(
             if ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU {
                 let menu = CreatePopupMenu().unwrap();
                 let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings..."));
+                let _ = AppendMenuW(menu, MF_STRING, ID_SEND, w!("Send file to Mac viewer..."));
                 let _ = AppendMenuW(menu, MF_STRING, ID_KILL, w!("Disconnect all sessions"));
                 let url = wide(&crate::settings::url());
                 let _ = AppendMenuW(menu, MF_STRING, ID_OPEN, PCWSTR(url.as_ptr()));
+                let audio_item = match crate::audio::stream_url() {
+                    Some(url) => wide(&format!("Copy audio stream URL ({url})")),
+                    None => {
+                        let _ = AppendMenuW(
+                            menu,
+                            MF_STRING | MF_GRAYED,
+                            ID_AUDIO_URL,
+                            w!("Audio streaming is off (Settings > General)"),
+                        );
+                        Vec::new()
+                    }
+                };
+                if !audio_item.is_empty() {
+                    let _ = AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        ID_AUDIO_URL,
+                        PCWSTR(audio_item.as_ptr()),
+                    );
+                }
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                 let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT, w!("About restsend-vnc"));
                 let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
@@ -206,6 +247,45 @@ unsafe extern "system" fn tray_proc(
                         let _ = SetForegroundWindow(HWND(existing as *mut core::ffi::c_void));
                     } else {
                         open_settings();
+                    }
+                }
+                ID_SEND => {
+                    let existing = SEND_HWND.load(Ordering::Relaxed);
+                    if existing != 0 {
+                        let _ = SetForegroundWindow(HWND(existing as *mut core::ffi::c_void));
+                    } else {
+                        open_send_panel();
+                    }
+                }
+                ID_AUDIO_URL => {
+                    if let Some(url) = crate::audio::stream_url() {
+                        let copied = arboard::Clipboard::new()
+                            .and_then(|mut cb| cb.set_text(url.clone()))
+                            .is_ok();
+                        let body = if copied {
+                            format!(
+                                "Audio stream URL copied to the clipboard:\n\n{url}\n\n\
+                                 Open it on the Mac in Safari to listen \
+                                 (the URL is also synced to the Mac clipboard via Screen Sharing)."
+                            )
+                        } else {
+                            format!("Audio stream URL (copy manually):\n\n{url}")
+                        };
+                        let text = wide(&body);
+                        MessageBoxW(
+                            Some(hwnd),
+                            PCWSTR(text.as_ptr()),
+                            w!("restsend-vnc audio"),
+                            MB_OK | MB_ICONINFORMATION,
+                        );
+                    } else {
+                        MessageBoxW(
+                            Some(hwnd),
+                            w!("Audio streaming is off.\n\nEnable \"Stream system audio\" under \
+                                Settings > General, then use this menu again."),
+                            w!("restsend-vnc audio"),
+                            MB_OK | MB_ICONINFORMATION,
+                        );
                     }
                 }
                 ID_KILL => {
@@ -543,6 +623,318 @@ unsafe extern "system" fn confirm_proc(
     LRESULT(0)
 }
 
+/// Tray menu "Send file to Mac viewer...": panel that queues files and
+/// pushes them to connected Apple (Screen Sharing) clients. The viewer then
+/// resolves the file promises through the ARD `0x22` channel when the user
+/// presses Cmd+V on the Mac.
+unsafe fn open_send_panel() {
+    let hinst = GetModuleHandleW(None).unwrap();
+    let class = w!("restsend_vnc_send_wnd");
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(send_panel_proc),
+        hInstance: hinst.into(),
+        lpszClassName: class,
+        hbrBackground: HBRUSH((COLOR_WINDOW.0 as isize + 1) as *mut core::ffi::c_void),
+        ..Default::default()
+    };
+    RegisterClassW(&wc);
+
+    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE;
+    let dpi = GetDpiForSystem() as f32;
+    let scale = (dpi / 96.0).max(1.0);
+    let f = |v: i32| ((v as f32) * scale).round() as i32;
+    ensure_ui_font(scale);
+
+    let mut wr = RECT {
+        left: 0,
+        top: 0,
+        right: f(480),
+        bottom: f(440),
+    };
+    let _ = AdjustWindowRectEx(&mut wr, style, false, WINDOW_EX_STYLE(0));
+
+    let hwnd = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        class,
+        w!("restsend-vnc - send files"),
+        style,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        wr.right - wr.left,
+        wr.bottom - wr.top,
+        None,
+        None,
+        Some(hinst.into()),
+        None,
+    )
+    .unwrap_or_default();
+    if hwnd.0.is_null() {
+        return;
+    }
+    SEND_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+
+    let hi = hinst.0 as isize;
+    let label: WINDOW_STYLE = WS_CHILD | WS_VISIBLE;
+    let button: WINDOW_STYLE = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
+    let list: WINDOW_STYLE = WS_CHILD
+        | WS_VISIBLE
+        | WS_TABSTOP
+        | WS_BORDER
+        | WS_VSCROLL
+        | WINDOW_STYLE((LBS_HASSTRINGS | LBS_MULTIPLESEL | LBS_NOTIFY) as u32);
+
+    ctrl(hwnd, w!("LISTBOX"), w!(""), list, f(18), f(14), f(444), f(140), C_SF_LIST, hi);
+    ctrl(hwnd, w!("BUTTON"), w!("Add files..."), button, f(18), f(162), f(100), f(28), C_SF_ADD, hi);
+    ctrl(hwnd, w!("BUTTON"), w!("Remove"), button, f(124), f(162), f(90), f(28), C_SF_REMOVE, hi);
+    ctrl(hwnd, w!("BUTTON"), w!("Clear offer"), button, f(220), f(162), f(100), f(28), C_SF_CLEAR, hi);
+    ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Send"),
+        button | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+        f(352),
+        f(162),
+        f(110),
+        f(28),
+        C_SF_SEND,
+        hi,
+    );
+    ctrl(hwnd, w!("STATIC"), w!(""), label, f(18), f(200), f(444), f(56), C_SF_STATUS, hi);
+    ctrl(hwnd, w!("STATIC"), w!("Transfer log:"), label, f(18), f(258), f(200), f(20), 0, hi);
+    ctrl(
+        hwnd,
+        w!("LISTBOX"),
+        w!(""),
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL,
+        f(18),
+        f(278),
+        f(444),
+        f(120),
+        C_SF_LOG,
+        hi,
+    );
+
+    SEND_LOG_SEEN.store(u64::MAX, Ordering::Relaxed);
+    send_panel_refresh(hwnd);
+    let _ = SetTimer(Some(hwnd), 1, 500, None);
+
+    let mut msg = MSG::default();
+    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        if crate::settings::EXIT.load(Ordering::Relaxed) {
+            break;
+        }
+        let _ = TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+/// One line of guidance under the file list.
+fn send_panel_status() -> String {
+    let clients = crate::filesend::apple_session_count();
+    if !crate::settings::share_files() {
+        return "Share files is off - enable it in Settings > Files first.\
+                \nSent files can only be downloaded while sharing is enabled."
+            .to_string();
+    }
+    if clients == 0 {
+        return "No Screen Sharing client is connected yet.\
+                \nAdd files here; they are offered as soon as a Mac viewer connects.\
+                \nOn the Mac, the files land on the clipboard: press Cmd+V in Finder to save."
+            .to_string();
+    }
+    format!(
+        "{clients} Apple client(s) connected. On the Mac, the offered files land on the \
+         clipboard: press Cmd+V in Finder (or any folder) to save them."
+    )
+}
+
+/// Re-fills the file list, status line and (when grown) the log listbox.
+unsafe fn send_panel_refresh(hwnd: HWND) {
+    let files: Vec<String> = SEND_FILES
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let list = GetDlgItem(Some(hwnd), C_SF_LIST).unwrap_or_default();
+    let _ = SendMessageW(list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+    for f in &files {
+        let wv = wide(f);
+        SendMessageW(list, LB_ADDSTRING, Some(WPARAM(0)), Some(LPARAM(wv.as_ptr() as isize)));
+    }
+    let status = wide(&send_panel_status());
+    let _ = SetDlgItemTextW(hwnd, C_SF_STATUS, PCWSTR(status.as_ptr()));
+
+    let log = crate::filesend::log_snapshot();
+    let len = log.len() as u64;
+    if SEND_LOG_SEEN.swap(len, Ordering::Relaxed) != len {
+        let log_list = GetDlgItem(Some(hwnd), C_SF_LOG).unwrap_or_default();
+        let _ = SendMessageW(log_list, LB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
+        for (stamp, line) in log.iter().rev() {
+            let _ = stamp;
+            let now = chrono::Local::now();
+            let stamp = now.format("%H:%M:%S").to_string();
+            let text = format!("[{stamp}] {line}");
+            let wv = wide(&text);
+            SendMessageW(
+                log_list,
+                LB_ADDSTRING,
+                Some(WPARAM(0)),
+                Some(LPARAM(wv.as_ptr() as isize)),
+            );
+        }
+    }
+}
+
+/// Native multi-select file dialog; returns the picked paths.
+unsafe fn pick_files(owner: HWND) -> Vec<PathBuf> {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, OFN_ALLOWMULTISELECT, OFN_EXPLORER, OFN_FILEMUSTEXIST,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    let mut buf = vec![0u16; 64 * 1024];
+    let mut filter = wide("All files (*.*)");
+    filter.push(0);
+    filter.extend_from_slice(wide("*.*").as_slice());
+    filter.push(0);
+    filter.push(0);
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrTitle: w!("Choose files to send to the viewer"),
+        Flags: OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+        ..Default::default()
+    };
+    if !GetOpenFileNameW(&mut ofn).as_bool() {
+        return Vec::new();
+    }
+    // Explorer layout: "C:\dir\0name1\0name2\0\0" (a single file is just one path).
+    let mut parts: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    for (i, &c) in buf.iter().enumerate() {
+        if c == 0 {
+            if i == start {
+                break;
+            }
+            parts.push(String::from_utf16_lossy(&buf[start..i]));
+            start = i + 1;
+            if start >= buf.len() {
+                break;
+            }
+        }
+    }
+    match parts.len() {
+        0 => Vec::new(),
+        1 => vec![PathBuf::from(&parts[0])],
+        _ => {
+            let dir = PathBuf::from(&parts[0]);
+            parts[1..].iter().map(|n| dir.join(n)).collect()
+        }
+    }
+}
+
+/// Adds picked files to the queue, dropping duplicates.
+unsafe fn send_panel_add(hwnd: HWND) {
+    let picked = pick_files(hwnd);
+    if picked.is_empty() {
+        return;
+    }
+    let mut files = SEND_FILES.lock().unwrap();
+    for path in picked {
+        if !files.contains(&path) {
+            files.push(path);
+        }
+    }
+}
+
+/// Removes the selected entries from the queue.
+unsafe fn send_panel_remove(hwnd: HWND) {
+    let list = GetDlgItem(Some(hwnd), C_SF_LIST).unwrap_or_default();
+    let count = SendMessageW(list, LB_GETSELCOUNT, Some(WPARAM(0)), Some(LPARAM(0))).0;
+    if count <= 0 {
+        return;
+    }
+    let mut items = vec![0i32; count as usize];
+    SendMessageW(
+        list,
+        LB_GETSELITEMS,
+        Some(WPARAM(count as usize)),
+        Some(LPARAM(items.as_mut_ptr() as isize)),
+    );
+    let mut files = SEND_FILES.lock().unwrap();
+    // Remove highest index first so the remaining indices stay valid.
+    items.sort_unstable_by(|a, b| b.cmp(a));
+    for index in items {
+        if index >= 0 && (index as usize) < files.len() {
+            files.remove(index as usize);
+        }
+    }
+}
+
+/// Pushes the queued files to Apple clients.
+unsafe fn send_panel_send(hwnd: HWND) {
+    let files = SEND_FILES.lock().unwrap().clone();
+    if files.is_empty() {
+        let text = wide("Add at least one file first.");
+        let _ = SetDlgItemTextW(hwnd, C_SF_STATUS, PCWSTR(text.as_ptr()));
+        let _ = MessageBeep(MB_ICONWARNING);
+        return;
+    }
+    if !crate::settings::share_files() {
+        let text = wide("Share files is off. Enable it in Settings > Files, then send again.");
+        let _ = SetDlgItemTextW(hwnd, C_SF_STATUS, PCWSTR(text.as_ptr()));
+        let _ = MessageBeep(MB_ICONWARNING);
+        return;
+    }
+    let notified = crate::filesend::offer_files(files);
+    tracing::info!("tray: file offer pushed to {notified} Apple client(s)");
+    send_panel_refresh(hwnd);
+}
+
+unsafe extern "system" fn send_panel_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => return control_color(wparam),
+        WM_COMMAND => {
+            if clicked(wparam, C_SF_ADD) {
+                send_panel_add(hwnd);
+                send_panel_refresh(hwnd);
+            } else if clicked(wparam, C_SF_REMOVE) {
+                send_panel_remove(hwnd);
+                send_panel_refresh(hwnd);
+            } else if clicked(wparam, C_SF_CLEAR) {
+                SEND_FILES.lock().unwrap().clear();
+                crate::filesend::clear_manual();
+                send_panel_refresh(hwnd);
+            } else if clicked(wparam, C_SF_SEND) {
+                send_panel_send(hwnd);
+            }
+        }
+        WM_TIMER => {
+            if wparam.0 == 1 {
+                send_panel_refresh(hwnd);
+            }
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+        }
+        WM_DESTROY => {
+            let _ = KillTimer(Some(hwnd), 1);
+            SEND_HWND.store(0, Ordering::Relaxed);
+            PostQuitMessage(0);
+        }
+        _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+    LRESULT(0)
+}
+
 unsafe fn open_settings() {
     let hinst = GetModuleHandleW(None).unwrap();
     let class = w!("restsend_vnc_settings_wnd");
@@ -824,6 +1216,63 @@ unsafe fn open_settings() {
         f(258),
         f(400),
         f(44),
+        0,
+        hi,
+    ));
+
+    general.push(ctrl(
+        hwnd,
+        w!("BUTTON"),
+        w!("Stream system audio (viewer opens a browser link)"),
+        check,
+        f(24),
+        f(306),
+        f(400),
+        f(24),
+        C_AUDIO,
+        hi,
+    ));
+    let _ = CheckDlgButton(
+        hwnd,
+        C_AUDIO,
+        DLG_BUTTON_CHECK_STATE(if s.audio_enabled { 1 } else { 0 }),
+    );
+    general.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Audio port:"),
+        label,
+        f(24),
+        f(338),
+        f(70),
+        f(20),
+        0,
+        hi,
+    ));
+    let audio_port = ctrl(
+        hwnd,
+        w!("EDIT"),
+        w!(""),
+        edit,
+        f(100),
+        f(336),
+        f(90),
+        f(24),
+        C_AUDIO_PORT,
+        hi,
+    );
+    let atxt = wide(&s.audio_port.to_string());
+    let _ = SetWindowTextW(audio_port, PCWSTR(atxt.as_ptr()));
+    general.push(audio_port);
+    general.push(ctrl(
+        hwnd,
+        w!("STATIC"),
+        w!("Tray > Copy audio stream URL gives the link."),
+        WS_CHILD | WS_VISIBLE,
+        f(200),
+        f(338),
+        f(230),
+        f(20),
         0,
         hi,
     ));
@@ -1314,6 +1763,10 @@ unsafe extern "system" fn settings_proc(
                     tls,
                     tls_cert: crate::settings::load().tls_cert,
                     tls_key: crate::settings::load().tls_key,
+                    audio_enabled: IsDlgButtonChecked(hwnd, C_AUDIO) == 1,
+                    audio_port: read_text(hwnd, C_AUDIO_PORT)
+                        .parse::<u16>()
+                        .unwrap_or(5901),
                 };
                 crate::settings::save(&s);
                 crate::settings::apply_live(&s);

@@ -759,3 +759,243 @@ fn apple_session_starts_encrypted_record_layer() {
     let _ = std::fs::remove_file(&clip_file);
     let _ = std::fs::remove_dir_all(&share_dir);
 }
+
+/// Extracts `public.file-url` entries from a pasteboard archive.
+fn parse_file_urls(archive: &[u8]) -> Vec<String> {
+    struct Rd<'a> {
+        d: &'a [u8],
+        p: usize,
+    }
+    impl Rd<'_> {
+        fn u32(&mut self) -> Option<u32> {
+            let v = u32::from_be_bytes(self.d.get(self.p..self.p + 4)?.try_into().ok()?);
+            self.p += 4;
+            Some(v)
+        }
+        fn blob(&mut self) -> Option<Vec<u8>> {
+            let len = self.u32()? as usize;
+            let bytes = self.d.get(self.p..self.p + len)?.to_vec();
+            self.p += len;
+            Some(bytes)
+        }
+        fn skip_item(&mut self) -> Option<Vec<String>> {
+            let flavors = self.u32()?;
+            let mut urls = Vec::new();
+            for _ in 0..flavors {
+                let uti = String::from_utf8_lossy(&self.blob()?).into_owned();
+                let _reserved = self.u32()?;
+                let tags = self.u32()?;
+                for _ in 0..tags {
+                    let _ = self.blob()?;
+                    let _ = self.blob()?;
+                }
+                let data = self.blob()?;
+                if uti == "public.file-url" {
+                    urls.push(String::from_utf8_lossy(&data).into_owned());
+                }
+            }
+            Some(urls)
+        }
+    }
+    let mut rd = Rd { d: archive, p: 0 };
+    let mut out = Vec::new();
+    while rd.p < rd.d.len() {
+        match rd.skip_item() {
+            Some(urls) => out.extend(urls),
+            None => break,
+        }
+    }
+    out
+}
+
+/// The send-files panel: a pre-loaded offer must replace the host clipboard
+/// on the pasteboard and the file must be downloadable through `0x22` even
+/// though it lives outside the share root.
+#[test]
+fn send_panel_offer_is_served_and_downloadable() {
+    let port = free_port();
+    let share_dir = std::env::temp_dir().join(format!(
+        "restsend-vnc-offer-share-{}-{}",
+        std::process::id(),
+        port
+    ));
+    std::fs::create_dir_all(&share_dir).unwrap();
+    // The offered file deliberately lives OUTSIDE the share root: only the
+    // offer makes it fetchable.
+    let offered_path = std::env::temp_dir().join(format!(
+        "restsend-vnc-offer-file-{}-{}.txt",
+        std::process::id(),
+        port
+    ));
+    std::fs::write(&offered_path, b"panel offered payload").unwrap();
+    let clip_file = std::env::temp_dir().join(format!(
+        "restsend-vnc-offer-clip-{}-{}.txt",
+        std::process::id(),
+        port
+    ));
+    std::fs::write(&clip_file, "clipboard text must lose to the offer").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_restsend-vnc"))
+        .args([
+            "--test-pattern",
+            "--no-auth",
+            "--no-confirm",
+            "--allow-cidrs",
+            "127.0.0.1/32",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--share-dir",
+            &share_dir.to_string_lossy(),
+        ])
+        .env("RESTSEND_VNC_ALLOW_MULTIPLE", "1")
+        .env("RESTSEND_VNC_CLIPBOARD_FILE", &clip_file)
+        .env("RESTSEND_VNC_OFFER_FILE", &offered_path)
+        .env("RUST_LOG", "restsend_vnc=info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn restsend-vnc");
+    let _guard = KillOnDrop(child);
+
+    let mut s = connect_retry(port);
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.set_write_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    let mut version = [0u8; 12];
+    s.read_exact(&mut version).unwrap();
+    assert_eq!(&version, b"RFB 003.889\n");
+    s.write_all(b"RFB 003.889\n").unwrap();
+
+    let dh_key = apple_dh(&mut s);
+    s.write_all(&[0xC1]).unwrap();
+    let _width = read_u16(&mut s);
+    let _height = read_u16(&mut s);
+    let mut pf = [0u8; 16];
+    s.read_exact(&mut pf).unwrap();
+    let name_len = read_u32(&mut s) as usize;
+    let mut name = vec![0u8; name_len];
+    s.read_exact(&mut name).unwrap();
+
+    // Full ViewerInfo prelude (66 bytes), then request the record layer.
+    let mut viewer_info = vec![0x21u8, 0, 0, 0x3E, 0, 1];
+    for value in [2u32, 6, 1, 0, 26, 6, 2] {
+        viewer_info.extend_from_slice(&value.to_be_bytes());
+    }
+    viewer_info.extend_from_slice(&[0u8; 32]);
+    s.write_all(&viewer_info).unwrap();
+    s.write_all(&[0x12, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0, 1])
+        .unwrap();
+
+    let fbu_type = read_u8(&mut s);
+    assert_eq!(fbu_type, 0);
+    let _pad = read_u8(&mut s);
+    assert_eq!(read_u16(&mut s), 1);
+    for _ in 0..4 {
+        read_u16(&mut s);
+    }
+    assert_eq!(read_u32(&mut s), 1103);
+    assert_eq!(read_u32(&mut s), 1);
+    let mut enc_key = [0u8; 16];
+    let mut enc_iv = [0u8; 16];
+    s.read_exact(&mut enc_key).unwrap();
+    s.read_exact(&mut enc_iv).unwrap();
+    aes_ecb_decrypt_block(&dh_key, &mut enc_key);
+    aes_ecb_decrypt_block(&dh_key, &mut enc_iv);
+    s.write_all(&[0x12, 0, 0, 2, 0, 1, 0, 0]).unwrap();
+
+    let mut enc = RecordCipher::new(enc_key, enc_iv);
+    let mut dec_iv = enc_iv;
+    let mut dec_seq = 0u32;
+
+    // Enable shared pasteboard, wait for the initial notification.
+    s.write_all(&enc.seal(&[0x15, 0, 0, 1, 0, 0, 0, 0]))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut saw_notice = false;
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.first() == Some(&0x14) {
+            saw_notice = true;
+            break;
+        }
+    }
+    assert!(saw_notice, "no initial pasteboard notification");
+
+    // Full fetch: the reply must advertise the offered file, not the
+    // clipboard text.
+    let mut fetch = vec![0x0bu8, 0, 0, 0];
+    fetch.extend_from_slice(&51u32.to_be_bytes());
+    s.write_all(&enc.seal(&fetch)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut urls: Vec<String> = Vec::new();
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.first() != Some(&0x1f) {
+            continue;
+        }
+        let uncompressed = u32::from_be_bytes(body[8..12].try_into().unwrap()) as usize;
+        let _compressed = u32::from_be_bytes(body[12..16].try_into().unwrap()) as usize;
+        let archive = inflate(&body[16..], uncompressed);
+        urls = parse_file_urls(&archive);
+        break;
+    }
+    assert!(
+        urls.iter().any(|u| u.contains("restsend-vnc-offer-file")),
+        "offer file URL missing from the pasteboard reply: {urls:?}"
+    );
+    let url = urls
+        .into_iter()
+        .find(|u| u.contains("restsend-vnc-offer-file"))
+        .unwrap();
+
+    // Download through `0x22` by echoing the file URL (Screen Sharing does
+    // exactly this when Finder resolves the file promise).
+    let session = 12u32;
+    s.write_all(&enc.seal(&file_frame(1, session, &start_body(&url))))
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut downloaded = Vec::new();
+    let mut item_name = None;
+    let mut saw_end = false;
+    while Instant::now() < deadline {
+        let body = RecordCipher::open(&mut s, &enc_key, &mut dec_iv, &mut dec_seq);
+        if body.first() != Some(&0x22) {
+            continue;
+        }
+        let (command, cmd_session, payload) = parse_file_frame(&body);
+        if cmd_session != session {
+            continue;
+        }
+        match command {
+            101 => {
+                let name_len = u16::from_be_bytes(payload[100..102].try_into().unwrap()) as usize;
+                item_name =
+                    Some(String::from_utf8_lossy(&payload[104..104 + name_len]).into_owned());
+            }
+            102 => {
+                let len = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
+                downloaded.extend_from_slice(&payload[4..4 + len]);
+            }
+            104 => {
+                assert_eq!(i32::from_le_bytes(payload[0..4].try_into().unwrap()), 0);
+                saw_end = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_end, "offered-file download did not end");
+    assert_eq!(downloaded, b"panel offered payload");
+    assert_eq!(
+        item_name.as_deref(),
+        offered_path.file_name().and_then(|n| n.to_str()),
+        "downloaded item name"
+    );
+
+    let _ = std::fs::remove_file(&offered_path);
+    let _ = std::fs::remove_file(&clip_file);
+    let _ = std::fs::remove_dir_all(&share_dir);
+}

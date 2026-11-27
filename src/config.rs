@@ -127,6 +127,19 @@ pub struct Cli {
     #[arg(long)]
     pub keep_awake: bool,
 
+    /// Stream system audio over a side HTTP port so viewers can listen in a
+    /// browser (overrides the persisted setting for this run)
+    #[arg(long)]
+    pub audio: bool,
+
+    /// Disable the audio stream for this run
+    #[arg(long)]
+    pub no_audio: bool,
+
+    /// Port for the audio stream (default 5901, one above the VNC port)
+    #[arg(long, value_name = "PORT")]
+    pub audio_port: Option<u16>,
+
     /// Disable clipboard sync in both directions
     #[arg(long)]
     pub no_clipboard: bool,
@@ -169,6 +182,9 @@ pub struct Config {
     pub tls: Option<crate::tls::Mode>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
+    /// CLI override for the persisted audio-stream setting.
+    pub audio: Option<bool>,
+    pub audio_port: Option<u16>,
 }
 
 impl Config {
@@ -245,6 +261,10 @@ impl Config {
             return Err("--view-only and --no-view-only cannot be used together".into());
         }
 
+        if cli.audio && cli.no_audio {
+            return Err("--audio and --no-audio cannot be used together".into());
+        }
+
         if let Some(raw) = &cli.allow_cidrs {
             crate::acl::check(raw).map_err(|e| format!("--allow-cidrs {raw:?}: {e}"))?;
         }
@@ -287,6 +307,14 @@ impl Config {
             tls: cli.tls,
             tls_cert: cli.tls_cert,
             tls_key: cli.tls_key,
+            audio: if cli.audio {
+                Some(true)
+            } else if cli.no_audio {
+                Some(false)
+            } else {
+                None
+            },
+            audio_port: cli.audio_port,
         })
     }
 }

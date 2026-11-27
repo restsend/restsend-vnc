@@ -57,8 +57,10 @@ const APPLE_FRAME_QUEUE_LIMIT: usize = 192 << 20;
 const DOWNLOAD_CHUNK: usize = 8192;
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound the RFB/TLS handshake so a slow or silent client cannot pin a
-/// session thread forever.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// session thread forever. Generous on purpose: Apple Screen Sharing picks
+/// the security type only after its local login dialog is submitted, and a
+/// human typing credentials can easily take a minute.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a session waits for the first captured frame (viewer connect
 /// timeouts are typically ~30s; keep well below).
 const FIRST_FRAME_WAIT: Duration = Duration::from_secs(10);
@@ -1714,22 +1716,33 @@ impl Session {
             Ok(file) => file,
             Err(e) => {
                 tracing::warn!("{peer}: cannot open {}: {e}", path.display());
+                crate::filesend::record_transfer(format!(
+                    "FAILED to send {}: {e}",
+                    path.display()
+                ));
                 self.send(af::end_message(session, af::STATUS_PERMISSION))?;
                 return Ok(());
             }
         };
         tracing::info!("{peer}: ARD download {} ({size} bytes)", path.display());
+        crate::filesend::record_transfer(format!(
+            "sending {} ({size} bytes)...",
+            path.display()
+        ));
         self.send(info)?;
         self.send(item)?;
+        let mut sent = 0u64;
         let mut buffer = vec![0u8; af::CHUNK_SIZE];
         loop {
             let n = file.read(&mut buffer)?;
             if n == 0 {
                 break;
             }
+            sent += n as u64;
             self.send(af::data_message(session, &buffer[..n]))?;
         }
         self.send(af::end_message(session, 0))?;
+        crate::filesend::record_transfer(format!("sent {} ({sent} bytes) ✔", path.display()));
         Ok(())
     }
 
@@ -1742,11 +1755,15 @@ impl Session {
                 }
             }
         }
-        // Absolute path echoed from a file URL: only under the share root or
-        // explicitly present in the current host clipboard file list.
+        // Absolute path echoed from a file URL: only under the share root,
+        // in the current host clipboard file list, or offered by the
+        // send-files panel.
         let requested = crate::rfb::ard_file::local_path_from_request(request)?;
         let canonical = requested.canonicalize().ok()?;
         if canonical.starts_with(&root.canonical) && canonical.is_file() {
+            return Some(canonical);
+        }
+        if crate::filesend::is_offered(&canonical) && canonical.is_file() {
             return Some(canonical);
         }
         if let Some(content) = crate::clipboard::get_clipboard_content() {
@@ -1960,7 +1977,29 @@ impl Session {
                 if !self.cfg.clipboard_enabled || self.cfg.view_only {
                     return Ok(());
                 }
-                let content = crate::clipboard::get_clipboard_content().unwrap_or_default();
+                // An active send-panel offer replaces the host clipboard
+                // until it changes or expires.
+                let content = if let Some(files) = crate::filesend::offer() {
+                    if !files.is_empty() {
+                        self.ard_offered_files = files.clone();
+                        tracing::debug!(
+                            "{peer}: serving {} send-panel file(s) on the pasteboard",
+                            files.len()
+                        );
+                        crate::filesend::record_transfer(format!(
+                            "viewer fetched {} file promise(s)",
+                            files.len()
+                        ));
+                        crate::clipboard::ClipboardContent {
+                            text: None,
+                            files,
+                        }
+                    } else {
+                        crate::clipboard::get_clipboard_content().unwrap_or_default()
+                    }
+                } else {
+                    crate::clipboard::get_clipboard_content().unwrap_or_default()
+                };
                 tracing::debug!(
                     "{peer}: Apple pasteboard fetch echo={echo} promise={promise} \
                      ({} text bytes, {} files)",

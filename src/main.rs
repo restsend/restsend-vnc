@@ -9,6 +9,8 @@
 mod acl;
 mod approval;
 mod audit;
+#[cfg(target_os = "windows")]
+mod audio;
 mod autostart;
 mod awake;
 mod clipboard;
@@ -17,6 +19,7 @@ mod cursor;
 mod diff;
 mod encode;
 mod framebuffer;
+mod filesend;
 mod input;
 mod rfb;
 mod screen;
@@ -154,6 +157,12 @@ fn main() {
     if let Some(path) = &cfg.tls_key {
         effective.tls_key = Some(path.display().to_string());
     }
+    if let Some(audio) = cfg.audio {
+        effective.audio_enabled = audio;
+    }
+    if let Some(port) = cfg.audio_port {
+        effective.audio_port = port;
+    }
     settings::apply_live(&effective);
     tracing::info!(
         "settings: port={} color={} loopback_only={} confirm_connections={} allow_cidrs={:?} view_only={} keep_awake={} allow_debug={} tls={} url={}",
@@ -262,6 +271,17 @@ fn main() {
     // whether they may receive based on the live view-only setting.
     let hub = Arc::new(clipboard::ClipboardHub::new());
     hub.spawn_watcher(cfg.clipboard_enabled);
+    // The send-files panel pushes offers through the hub.
+    filesend::init(Arc::clone(&hub));
+    // Test hook: pre-load a send-panel file offer for headless tests.
+    if let Some(path) = std::env::var_os("RESTSEND_VNC_OFFER_FILE") {
+        let offered = filesend::offer_files(vec![std::path::PathBuf::from(path)]);
+        tracing::info!("test hook: offered file to {offered} Apple client(s)");
+    }
+
+    // --- audio stream (system sound -> browser, Windows only) ---
+    #[cfg(target_os = "windows")]
+    audio::spawn_supervisor();
 
     let auth_desc = if cfg.password.is_some() {
         "vnc auth"

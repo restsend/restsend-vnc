@@ -52,6 +52,10 @@ pub struct Settings {
     /// Optional user-provided certificate / key (PEM).
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    /// Stream system audio to browsers on a side HTTP port (Windows only).
+    pub audio_enabled: bool,
+    /// HTTP port the audio stream listens on.
+    pub audio_port: u16,
 }
 
 impl Default for Settings {
@@ -75,6 +79,8 @@ impl Default for Settings {
             tls: Mode::Auto,
             tls_cert: None,
             tls_key: None,
+            audio_enabled: false,
+            audio_port: 5901,
         }
     }
 }
@@ -95,6 +101,11 @@ pub static ALLOW_DEBUG: AtomicBool = AtomicBool::new(true);
 pub static TLS_MODE: AtomicU8 = AtomicU8::new(Mode::Auto as u8);
 /// File transfer is off unless the user opts in via the tray settings.
 pub static SHARE_FILES: AtomicBool = AtomicBool::new(false);
+/// Audio streaming live switch and port (Windows only).
+pub static AUDIO_ENABLED: AtomicBool = AtomicBool::new(false);
+pub static AUDIO_PORT: AtomicU16 = AtomicU16::new(5901);
+/// Incremented when the audio listener needs to rebind (port/loopback changed).
+pub static AUDIO_RELOAD: AtomicUsize = AtomicUsize::new(0);
 /// Incremented when the listener needs to rebind (port/loopback changed).
 pub static RELOAD: AtomicUsize = AtomicUsize::new(0);
 /// Set by the tray "Exit" item.
@@ -109,6 +120,26 @@ static TLS_KEY: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 pub fn tls_mode() -> Mode {
     Mode::from_u8(TLS_MODE.load(Ordering::Relaxed))
+}
+
+/// Random path token protecting the audio stream URL (per run).
+static AUDIO_TOKEN: OnceLock<String> = OnceLock::new();
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn audio_token() -> String {
+    // Test hook: pin the token so integration tests can build URLs.
+    if let Ok(token) = std::env::var("RESTSEND_VNC_AUDIO_TOKEN") {
+        if !token.is_empty() {
+            return token;
+        }
+    }
+    AUDIO_TOKEN
+        .get_or_init(|| {
+            let mut bytes = [0u8; 12];
+            let _ = getrandom::fill(&mut bytes);
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        })
+        .clone()
 }
 
 pub fn set_tls_mode(mode: Mode) {
@@ -346,6 +377,12 @@ pub fn load() -> Settings {
                     Some(v.to_string())
                 }
             }
+            "audio" => s.audio_enabled = v == "1" || v.eq_ignore_ascii_case("true"),
+            "audio_port" => {
+                if let Ok(p) = v.parse() {
+                    s.audio_port = p;
+                }
+            }
             "password" => {
                 s.password = if v.is_empty() {
                     None
@@ -368,7 +405,7 @@ pub fn save(s: &Settings) {
         let _ = std::fs::create_dir_all(dir);
     }
     let body = format!(
-        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nconfirm_connections={}\nallow_cidrs={}\nview_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nshare_files={}\nshare_dir={}\ntls={}\ntls_cert={}\ntls_key={}\nurl={}\n",
+        "# rvnc settings\nport={}\ncolor_level={}\nloopback_only={}\nconfirm_connections={}\nallow_cidrs={}\nview_only={}\nkeep_awake={}\nallow_debug={}\npassword={}\ntitle={}\nautostart={}\nlogon_task={}\nshare_files={}\nshare_dir={}\ntls={}\ntls_cert={}\ntls_key={}\naudio={}\naudio_port={}\nurl={}\n",
         s.port,
         s.color_level,
         s.loopback_only as u8,
@@ -386,6 +423,8 @@ pub fn save(s: &Settings) {
         s.tls,
         s.tls_cert.clone().unwrap_or_default(),
         s.tls_key.clone().unwrap_or_default(),
+        s.audio_enabled as u8,
+        s.audio_port,
         s.url
     );
     if let Ok(mut f) = std::fs::File::create(&path) {
@@ -413,6 +452,12 @@ pub fn apply_live(s: &Settings) {
     let old_port = PORT.swap(s.port, Ordering::Relaxed);
     if old_port != s.port || old_loop != s.loopback_only {
         RELOAD.fetch_add(1, Ordering::Relaxed);
+    }
+    let old_audio_port = AUDIO_PORT.swap(s.audio_port, Ordering::Relaxed);
+    let old_audio = AUDIO_ENABLED.swap(s.audio_enabled, Ordering::Relaxed);
+    if old_audio_port != s.audio_port || old_audio != s.audio_enabled || old_loop != s.loopback_only
+    {
+        AUDIO_RELOAD.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -446,6 +491,8 @@ pub fn current() -> Settings {
         tls: tls_mode(),
         tls_cert: tls_cert(),
         tls_key: tls_key(),
+        audio_enabled: AUDIO_ENABLED.load(Ordering::Relaxed),
+        audio_port: AUDIO_PORT.load(Ordering::Relaxed),
     }
 }
 

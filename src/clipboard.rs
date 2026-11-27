@@ -76,6 +76,11 @@ impl ClipboardHub {
         });
     }
 
+    /// Number of Apple 3.889 sessions registered for pasteboard pushes.
+    pub fn apple_session_count(&self) -> usize {
+        self.apple_sessions.lock().unwrap().len()
+    }
+
     /// Tells Apple viewers that the host pasteboard changed. They then fetch
     /// it via their own clipboard request. `cmd = 2` is the "pasteboard is
     /// available" notification used by AppleVNCServer.
@@ -139,7 +144,14 @@ fn watcher(hub: Arc<ClipboardHub>) {
                 continue;
             }
         }
+        let first_observation = hub.last_seen.lock().unwrap().is_none();
         *hub.last_seen.lock().unwrap() = Some(content.clone());
+        // An actual clipboard change supersedes a pending send-panel file
+        // offer. The first observation is just the startup snapshot, not a
+        // change, so it leaves a fresh offer alone.
+        if !first_observation {
+            crate::filesend::clear();
+        }
         if let Some(text) = content.text.as_deref() {
             tracing::debug!(len = text.len(), "host clipboard changed, broadcasting");
             hub.broadcast(crate::rfb::messages::server_cut_text(text));
