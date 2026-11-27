@@ -575,9 +575,9 @@ fn convert_samples(src: &[u8], dst: &mut [u8], channels: usize, sample_fmt: Samp
             }
         }
         SampleFmt::I16 => {
-            for (i, sample) in src.chunks_exact(2).take(frames * channels).enumerate() {
-                write_sample(i, i16::from_le_bytes(sample.try_into().unwrap()));
-            }
+            // 16-bit source is already our output format: plain copy.
+            let copy_len = (frames * channels * 2).min(src.len());
+            dst[..copy_len].copy_from_slice(&src[..copy_len]);
         }
         SampleFmt::I24 => {
             for (i, sample) in src.chunks_exact(3).take(frames * channels).enumerate() {
