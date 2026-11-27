@@ -123,6 +123,7 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
     ));
     std::fs::create_dir_all(&work).unwrap();
     let share_dir = work.join("share");
+    std::fs::create_dir_all(&share_dir).unwrap();
     let stderr_log = work.join("server.err.log");
     // Dump the server's stderr on ANY test failure: the audio capture or
     // encoder can take the process down natively (no Rust panic), and the
@@ -185,8 +186,13 @@ fn audio_http_endpoint_serves_page_and_gates_tokens() {
     // reported with its stderr tail: on runner SKUs without a usable Media
     // Foundation stack the capture thread can take the process down, which
     // this test records instead of masking.
-    let (status, head, body) =
-        http_get(audio_port, "/tokentokentoken/stream", Duration::from_secs(6));
+    // The server answers 503 after its own 8 s first-chunk deadline when no
+    // capture device is present; read longer than that so the 503 is seen.
+    let (status, head, body) = http_get(
+        audio_port,
+        "/tokentokentoken/stream",
+        Duration::from_secs(12),
+    );
     if status == 0 && !server_alive() {
         dump_server_log(&stderr_log);
         panic!(
